@@ -35,3 +35,14 @@ python -m uvicorn app.main:app --reload --port 8000
 - API docs: `http://localhost:8000/docs`
 
 Save these commands somewhere — this is everything you need from a fresh Windows machine.
+
+
+
+[plugin:vite:import-analysis] Failed to resolve import "@/lib/utils" from "src/components/MobileNav.tsx". Does the file exist?
+E:/LLM-Gateway/frontend/src/components/MobileNav.tsx:4:19
+2  |  import { NavLink } from "react-router-dom";
+3  |  import { MessageSquare, BarChart2, Zap, Menu, X } from "lucide-react";
+4  |  import { cn } from "@/lib/utils";
+   |                      ^
+5  |  var _jsxFileName = "E:/LLM-Gateway/frontend/src/components/MobileNav.tsx";
+6  |  import { jsxDEV as _jsxDEV } from "react/jsx-dev-runtime";
