@@ -1,5 +1,5 @@
 from app.clients import groq_client, gemini_client
-from app.cache import cache
+from app.cache.cache import cache
 from app.models.schemas import GatewayResponse, ComplexityLevel
 from app.core.config import get_settings
 
