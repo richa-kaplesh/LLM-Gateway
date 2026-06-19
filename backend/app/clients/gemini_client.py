@@ -1,12 +1,12 @@
 import time
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from app.core.config import get_settings
 from app.models.schemas import GatewayResponse, ComplexityLevel
 
 settings = get_settings()
 
-genai.configure(api_key=settings.GEMINI_API_KEY)
-client = genai.GenerativeModel(settings.GEMINI_MODEL)
+client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
 def calculate_cost(total_tokens: int) -> float:
@@ -17,7 +17,10 @@ async def complete(query: str) -> GatewayResponse:
     try:
         start_time = time.time()
 
-        response = client.generate_content(query)
+        response = client.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=query
+        )
 
         latency_ms = (time.time() - start_time) * 1000
 
@@ -37,8 +40,6 @@ async def complete(query: str) -> GatewayResponse:
     except Exception as e:
         if "quota" in str(e).lower():
             raise Exception("Gemini quota exceeded")
-
         if "connection" in str(e).lower():
             raise Exception("Gemini connection failed")
-
         raise Exception(f"Gemini error: {str(e)}")

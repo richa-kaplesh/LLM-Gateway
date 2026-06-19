@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 groq
-google-generativeai
+google-genai
 sentence-transformers
 numpy
 pydantic-settings

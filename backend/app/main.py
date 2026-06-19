@@ -5,7 +5,7 @@ from app.router.router import route
 from app.tracker.tracker import tracker
 from app.core.config import get_settings
 import groq
-import google.generativeai as genai
+from google import genai
 
 settings = get_settings()
 
