@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     SIMPLE_QUERY_WORD_LIMIT: int = 15
 
-    CACHE_SIMILARITY_THRESHOLD: float = 0.85
+    CACHE_SIMILARITY_THRESHOLD: float = 0.70
     CACHE_MAX_SIZE: int = 100
 
     APP_NAME: str = "LLM Gateway"
