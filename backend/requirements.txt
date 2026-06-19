@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+groq
+google-generativeai
+sentence-transformers
+numpy
+pydantic-settings
+python-dotenv
