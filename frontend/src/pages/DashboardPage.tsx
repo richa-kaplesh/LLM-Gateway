@@ -2,24 +2,28 @@ import { useEffect, useState, useCallback } from 'react'
 import {
   BarChart,
   Bar,
-  LineChart,
+  ComposedChart,
+  Scatter,
   Line,
   PieChart,
   Pie,
   Cell,
   XAxis,
   YAxis,
+  ZAxis,
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
   Legend,
 } from 'recharts'
+
 import { RefreshCw, TrendingUp, DollarSign, Layers, Zap, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardValue } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { fetchGlobalStats, type GlobalStats } from '@/lib/api'
+import { fetchGlobalStats, fetchRequests, type GlobalStats, type RequestRecord } from '@/lib/api'
+
 
 // ── Custom tooltip ────────────────────────────────────────────────────────────
 function ChartTooltip({
@@ -91,6 +95,7 @@ function ChartCard({
 // ── Main page ─────────────────────────────────────────────────────────────────
 export function DashboardPage() {
   const [stats, setStats] = useState<GlobalStats | null>(null)
+  const [requests, setRequests] = useState<RequestRecord[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
 
@@ -98,8 +103,9 @@ export function DashboardPage() {
     if (isRefresh) setRefreshing(true)
     else setLoading(true)
     try {
-      const data = await fetchGlobalStats()
+      const [data, reqs] = await Promise.all([fetchGlobalStats(), fetchRequests()])
       setStats(data)
+      setRequests(reqs)
     } catch (err) {
       toast.error((err as Error).message || 'Failed to load stats.')
     } finally {
@@ -120,11 +126,29 @@ export function DashboardPage() {
       ]
     : []
 
-  const costData = (stats?.requests_over_time ?? []).map((r, i) => ({
-    index: i + 1,
-    cost: parseFloat((r.cost_usd * 1_000_000).toFixed(4)),
-    label: r.timestamp ? new Date(r.timestamp).toLocaleTimeString() : `#${i + 1}`,
-  }))
+  // ── Chart data (Cost per Request) ───────────────────────────────────────────
+  // Sort by timestamp, assign 1-based integer x for clean axis labels
+  const allSorted = [...requests]
+    .map((r, i) => ({ ...r, idx: i }))
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+
+  const scatterAllHits = allSorted
+    .filter((r) => r.cache_hit)
+    .map((r) => ({
+      x: r.idx + 1,
+      y: parseFloat((r.cost_usd * 1_000_000).toFixed(6)),
+      label: new Date(r.timestamp).toLocaleTimeString(),
+      model: r.model_used,
+    }))
+
+  const scatterAllMisses = allSorted
+    .filter((r) => !r.cache_hit)
+    .map((r) => ({
+      x: r.idx + 1,
+      y: parseFloat((r.cost_usd * 1_000_000).toFixed(6)),
+      label: new Date(r.timestamp).toLocaleTimeString(),
+      model: r.model_used,
+    }))
 
   const hitRate = stats ? Math.round(stats.cache_hit_rate * 100) : 0
   const donutData = [
@@ -167,13 +191,13 @@ export function DashboardPage() {
         />
         <StatCard
           title="Total Cost"
-          value={stats ? `$${stats.total_cost_usd.toFixed(4)}` : '—'}
+          value={stats ? `$${stats.total_cost_usd.toFixed(6)}` : '—'}
           icon={<DollarSign className="w-4 h-4" />}
           loading={loading}
         />
         <StatCard
           title="Cost Saved"
-          value={stats ? `$${stats.total_cost_saved_usd.toFixed(4)}` : '—'}
+          value={stats ? `$${stats.total_cost_saved_usd.toFixed(6)}` : '—'}
           icon={<TrendingUp className="w-4 h-4" />}
           loading={loading}
         />
@@ -261,57 +285,88 @@ export function DashboardPage() {
         </ChartCard>
       </div>
 
-      {/* Line chart */}
+      {/* Scatter chart – Cost per Request */}
       <ChartCard title="Cost per Request (µ$)" loading={loading}>
-        {costData.length === 0 ? (
+        {requests.length === 0 ? (
           <div className="flex items-center justify-center h-48 text-sm text-[#555]">
             No request data available
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={costData}>
+            <ComposedChart margin={{ bottom: 16 }}>
               <CartesianGrid vertical={false} stroke="#1a1a1a" />
               <XAxis
-                dataKey="label"
+                type="number"
+                dataKey="x"
+                name="Request #"
                 tick={{ fill: '#555', fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
-                interval="preserveStartEnd"
+                label={{ value: 'Request #', position: 'insideBottom', offset: -4, fill: '#444', fontSize: 11 }}
+                domain={[1, requests.length]}
+                allowDuplicatedCategory={false}
+                tickCount={Math.min(requests.length, 10)}
+                tickFormatter={(v) => Math.round(v).toString()}
               />
               <YAxis
+                type="number"
+                dataKey="y"
+                name="Cost (µ$)"
                 tick={{ fill: '#555', fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
-                width={40}
-                tickFormatter={(v) => `${v}`}
+                width={44}
               />
+              <ZAxis range={[50, 50]} />
               <Tooltip
-                content={({ active, payload, label }) => (
-                  <ChartTooltip
-                    active={active}
-                    label={String(label ?? '')}
-                    payload={payload?.map((p) => ({
-                      name: 'Cost (µ$)',
-                      value: p.value as number,
-                      color: '#ededed',
-                    }))}
-                  />
-                )}
-                cursor={{ stroke: '#333' }}
+                cursor={{ strokeDasharray: '3 3', stroke: '#333' }}
+                content={({ active, payload }) => {
+                  if (!active || !payload?.length) return null
+                  const d = payload[0].payload as { x: number; y: number; label: string; model: string }
+                  const isHit = payload[0].fill === '#22c55e' || payload[0].stroke === '#22c55e'
+                  return (
+                    <div className="rounded-md border border-[#262626] bg-[#0f0f0f] px-3 py-2 text-xs shadow-xl space-y-1">
+                      <p className="text-[#555]">Request #{d.x} &middot; {d.label}</p>
+                      <p style={{ color: isHit ? '#22c55e' : '#a78bfa' }}>
+                        {isHit ? '● Cache Hit' : '● Cache Miss'}
+                      </p>
+                      <p className="text-[#ededed] font-medium">
+                        Cost: {d.y.toFixed(6)} µ$
+                      </p>
+                      <p className="text-[#888]">Model: {d.model}</p>
+                    </div>
+                  )
+                }}
               />
               <Legend
-                wrapperStyle={{ fontSize: 12, color: '#555' }}
-                formatter={() => 'Cost µ$'}
+                wrapperStyle={{ fontSize: 12, paddingTop: 8 }}
+                formatter={(value) => (
+                  <span style={{ color: value === 'Cache Hit' ? '#22c55e' : '#a78bfa' }}>{value}</span>
+                )}
               />
               <Line
-                type="monotone"
-                dataKey="cost"
-                stroke="#ededed"
+                data={scatterAllHits}
+                dataKey="y"
+                name="Cache Hit"
+                stroke="#22c55e"
                 strokeWidth={1.5}
-                dot={false}
-                activeDot={{ r: 4, fill: '#ededed', strokeWidth: 0 }}
+                dot={{ r: 4, fill: '#22c55e', strokeWidth: 0 }}
+                activeDot={{ r: 6, fill: '#22c55e', strokeWidth: 0 }}
+                type="monotone"
+                legendType="circle"
               />
-            </LineChart>
+              <Line
+                data={scatterAllMisses}
+                dataKey="y"
+                name="Cache Miss"
+                stroke="#a78bfa"
+                strokeWidth={1.5}
+                dot={{ r: 4, fill: '#a78bfa', strokeWidth: 0 }}
+                activeDot={{ r: 6, fill: '#a78bfa', strokeWidth: 0 }}
+                type="monotone"
+                legendType="circle"
+              />
+            </ComposedChart>
           </ResponsiveContainer>
         )}
       </ChartCard>

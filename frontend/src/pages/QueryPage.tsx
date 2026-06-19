@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { Send, Clock, DollarSign, Zap, CheckCircle2, Circle, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -33,8 +35,10 @@ function ResponseCard({ entry }: { entry: HistoryEntry }) {
       {/* Answer bubble */}
       <div className="flex justify-start">
         <div className="max-w-[85%] space-y-3">
-          <div className="rounded-lg bg-[#111] border border-[#1f1f1f] px-3.5 py-2.5 text-sm text-[#ededed] leading-relaxed">
-            {entry.response.answer}
+          <div className="rounded-lg bg-[#111] border border-[#1f1f1f] px-3.5 py-2.5 leading-relaxed overflow-x-auto">
+            <div className="prose-dark">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{entry.response.answer}</ReactMarkdown>
+            </div>
           </div>
 
           {/* Metadata row */}

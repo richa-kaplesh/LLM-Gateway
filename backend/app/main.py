@@ -59,6 +59,9 @@ async def handle_query(request: GatewayRequest):
             response=response
         )
 
+        print("TRACKER LOGS:", len(tracker.logs))
+        print("LAST LOG COST:", tracker.logs[-1].cost_usd if tracker.logs else "empty")
+
         return response
 
     except Exception as e:
@@ -73,3 +76,16 @@ async def global_stats():
 @app.get("/stats/user/{user_id}")
 async def user_stats(user_id: str):
     return tracker.get_user_stats(user_id)
+
+@app.get("/stats/requests")
+async def request_history():
+    return [
+        {
+            "timestamp": log.timestamp.isoformat(),
+            "cost_usd": log.cost_usd,
+            "latency_ms": log.latency_ms,
+            "model_used": log.model_used,
+            "cache_hit": log.cache_hit
+        }
+        for log in tracker.logs
+    ]
