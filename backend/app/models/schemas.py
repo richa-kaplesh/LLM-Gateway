@@ -9,15 +9,19 @@ class ComplexityLevel(str, Enum):
 
 
 class GatewayRequest(BaseModel):
-    query: str
-    user_id: str
+    model: str
+    messages: list[dict]
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[str] = None
     stream: bool = False
+    user_id: str
 
 
 class GatewayResponse(BaseModel):
-    response: str
+    content: Optional[str] = None
+    tool_calls: Optional[list[dict]] = None
+    finish_reason: Optional[str] = None
     model_used: str
-    complexity: ComplexityLevel
     cost_usd: float
     latency_ms: float
     cache_hit: bool

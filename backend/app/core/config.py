@@ -9,10 +9,11 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "llama-3.1-8b-instant"
     GEMINI_MODEL: str = "gemini-1.5-flash"
 
-    GROQ_COST_PER_MILLION_TOKENS: float = 0.05
-    GEMINI_COST_PER_MILLION_TOKENS: float = 0.075
+    GROQ_INPUT_COST_PER_MILLION: float = 0.15
+    GROQ_OUTPUT_COST_PER_MILLION: float = 0.60
 
-    SIMPLE_QUERY_WORD_LIMIT: int = 15
+    GEMINI_INPUT_COST_PER_MILLION: float = 0.075
+    GEMINI_OUTPUT_COST_PER_MILLION: float = 0.30
 
     CACHE_SIMILARITY_THRESHOLD: float = 0.70
     CACHE_MAX_SIZE: int = 100
