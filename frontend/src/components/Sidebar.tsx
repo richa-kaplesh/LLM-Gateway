@@ -9,13 +9,13 @@ const navItems = [
 
 export function Sidebar() {
   return (
-    <aside className="hidden md:flex flex-col w-56 shrink-0 border-r border-[#1f1f1f] bg-[#0a0a0a] h-screen sticky top-0">
+    <aside className="hidden md:flex flex-col w-56 shrink-0 border-r border-stone-200 bg-white h-screen sticky top-0 shadow-sm">
       {/* Logo */}
-      <div className="flex items-center gap-2.5 px-5 h-14 border-b border-[#1f1f1f]">
-        <div className="flex items-center justify-center w-7 h-7 rounded-md bg-white/5 border border-white/10">
-          <Zap className="w-3.5 h-3.5 text-white" />
+      <div className="flex items-center gap-2.5 px-5 h-14 border-b border-stone-200">
+        <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-amber-50 border border-amber-200">
+          <Zap className="w-3.5 h-3.5 text-amber-700" />
         </div>
-        <span className="text-sm font-semibold text-[#ededed] tracking-tight">LLM Gateway</span>
+        <span className="text-sm font-semibold text-stone-900 tracking-tight">LLM Gateway</span>
       </div>
 
       {/* Nav */}
@@ -27,10 +27,10 @@ export function Sidebar() {
             end
             className={({ isActive }) =>
               cn(
-                'flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors',
+                'flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-all duration-150',
                 isActive
-                  ? 'bg-white/8 text-[#ededed] font-medium'
-                  : 'text-[#888] hover:text-[#ededed] hover:bg-white/5'
+                  ? 'bg-amber-50 text-amber-800 font-medium border-l-2 border-amber-600 pl-[10px]'
+                  : 'text-stone-500 hover:text-stone-900 hover:bg-stone-100 hover:translate-x-0.5'
               )
             }
           >
@@ -41,8 +41,8 @@ export function Sidebar() {
       </nav>
 
       {/* Footer */}
-      <div className="px-5 py-4 border-t border-[#1f1f1f]">
-        <p className="text-[11px] text-[#444]">v1.0.0</p>
+      <div className="px-5 py-4 border-t border-stone-200">
+        <p className="text-[11px] text-stone-400">v1.0.0</p>
       </div>
     </aside>
   )

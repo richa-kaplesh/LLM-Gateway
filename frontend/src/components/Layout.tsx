@@ -4,7 +4,7 @@ import { MobileNav } from './MobileNav'
 
 export function Layout() {
   return (
-    <div className="flex h-screen bg-[#0a0a0a] overflow-hidden">
+    <div className="flex h-screen bg-[#F7F6F3] overflow-hidden">
       <Sidebar />
       <div className="flex flex-col flex-1 min-w-0">
         <MobileNav />

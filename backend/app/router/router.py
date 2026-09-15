@@ -1,42 +1,41 @@
 from app.clients import groq_client, gemini_client
 from app.cache.cache import cache
-from app.models.schemas import GatewayResponse, ComplexityLevel
-from app.core.config import get_settings
-from app.router.bucket import TokenBucket
+from app.models.schemas import GatewayRequest, GatewayResponse
+from app.router.bucket import get_provider_for_conversation, conversation_provider_map
 
-settings = get_settings()
-
-
-def classify_complexity(query: str) -> ComplexityLevel:
-    word_count = len(query.strip().split())
-
-    if word_count <= settings.SIMPLE_QUERY_WORD_LIMIT:
-        return ComplexityLevel.SIMPLE
-    return ComplexityLevel.COMPLEX
+CLIENTS = {"groq": groq_client, "gemini": gemini_client}
 
 
-async def route(query: str, user_id: str) -> GatewayResponse:
-    cached = cache.get(query)
-    if cached:
-        return cached
+def _other_provider(provider: str) -> str:
+    return "gemini" if provider == "groq" else "groq"
 
-    complexity = classify_complexity(query)
+
+async def route(request: GatewayRequest) -> GatewayResponse:
+    use_cache = request.tools is None  # never cache tool-calling turns
+
+    if use_cache:
+        cached = cache.get(request)
+        if cached:
+            return cached
+
+    provider = get_provider_for_conversation(request.conversation_id)
+    if provider is None:
+        raise Exception("Both providers are rate-limited right now. Try again shortly.")
 
     try:
-        if complexity == ComplexityLevel.SIMPLE:
-            response = await groq_client.complete(query)
-        else:
-            response = await gemini_client.complete(query)
-
-    except Exception as groq_or_gemini_error:
+        response = await CLIENTS[provider].complete(request)
+    except Exception as primary_error:
+        fallback_provider = _other_provider(provider)
         try:
-            if complexity == ComplexityLevel.SIMPLE:
-                response = await gemini_client.complete(query)
-            else:
-                response = await groq_client.complete(query)
+            response = await CLIENTS[fallback_provider].complete(request)
+            conversation_provider_map[request.conversation_id] = fallback_provider  # re-pin
         except Exception as fallback_error:
-            raise Exception(f"Both providers failed: {fallback_error}")
+            raise Exception(
+                f"Both providers failed. Primary ({provider}): {primary_error}. "
+                f"Fallback ({fallback_provider}): {fallback_error}"
+            )
 
-    cache.set(query, response)
+    if use_cache:
+        cache.set(request, response)
 
     return response

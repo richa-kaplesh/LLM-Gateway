@@ -6,9 +6,8 @@ from app.models.schemas import GatewayResponse
 @dataclass
 class RequestLog:
     user_id: str
-    query: str
+    conversation_id: str
     model_used: str
-    complexity: str
     cost_usd: float
     latency_ms: float
     cache_hit: bool
@@ -19,12 +18,11 @@ class CostTracker:
     def __init__(self):
         self.logs: list[RequestLog] = []
 
-    def log(self, user_id: str, query: str, response: GatewayResponse) -> None:
+    def log(self, user_id: str, conversation_id: str, response: GatewayResponse) -> None:
         log_entry = RequestLog(
             user_id=user_id,
-            query=query,
+            conversation_id=conversation_id,
             model_used=response.model_used,
-            complexity=response.complexity,
             cost_usd=response.cost_usd,
             latency_ms=response.latency_ms,
             cache_hit=response.cache_hit
@@ -33,7 +31,6 @@ class CostTracker:
 
     def get_user_stats(self, user_id: str) -> dict:
         user_logs = [l for l in self.logs if l.user_id == user_id]
-
         if not user_logs:
             return {"user_id": user_id, "message": "no requests found"}
 
@@ -42,7 +39,6 @@ class CostTracker:
         cache_hits = sum(1 for l in user_logs if l.cache_hit)
         avg_latency = sum(l.latency_ms for l in user_logs) / total_requests
 
-        # Cost saved = requests that hit cache * average LLM cost
         avg_llm_cost = (
             sum(l.cost_usd for l in user_logs if not l.cache_hit) /
             max(sum(1 for l in user_logs if not l.cache_hit), 1)
@@ -66,7 +62,7 @@ class CostTracker:
         total_requests = len(self.logs)
         total_cost = sum(l.cost_usd for l in self.logs)
         cache_hits = sum(1 for l in self.logs if l.cache_hit)
-        groq_requests = sum(1 for l in self.logs if "llama" in l.model_used)
+        groq_requests = sum(1 for l in self.logs if "llama" in l.model_used or "gpt-oss" in l.model_used)
         gemini_requests = sum(1 for l in self.logs if "gemini" in l.model_used)
 
         avg_llm_cost = (
@@ -86,5 +82,4 @@ class CostTracker:
         }
 
 
-# Single instance shared across entire app
 tracker = CostTracker()

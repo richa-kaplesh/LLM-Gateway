@@ -3,7 +3,6 @@ import {
   BarChart,
   Bar,
   ComposedChart,
-  Scatter,
   Line,
   PieChart,
   Pie,
@@ -24,7 +23,6 @@ import { Card, CardContent, CardHeader, CardTitle, CardValue } from '@/component
 import { Skeleton } from '@/components/ui/skeleton'
 import { fetchGlobalStats, fetchRequests, type GlobalStats, type RequestRecord } from '@/lib/api'
 
-
 // ── Custom tooltip ────────────────────────────────────────────────────────────
 function ChartTooltip({
   active,
@@ -37,12 +35,12 @@ function ChartTooltip({
 }) {
   if (!active || !payload?.length) return null
   return (
-    <div className="rounded-md border border-[#262626] bg-[#0f0f0f] px-3 py-2 text-xs shadow-xl">
-      {label && <p className="text-[#555] mb-1.5">{label}</p>}
+    <div className="rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs shadow-lg">
+      {label && <p className="text-stone-400 mb-1.5">{label}</p>}
       {payload.map((p) => (
         <p key={p.name} style={{ color: p.color }} className="flex gap-2 items-center">
-          <span className="text-[#888]">{p.name}:</span>
-          <span className="font-medium">{p.value}</span>
+          <span className="text-stone-500">{p.name}:</span>
+          <span className="font-medium text-stone-800">{p.value}</span>
         </p>
       ))}
     </div>
@@ -55,16 +53,21 @@ interface StatCardProps {
   value: string
   icon: React.ReactNode
   loading?: boolean
+  accent?: boolean
 }
-function StatCard({ title, value, icon, loading }: StatCardProps) {
+function StatCard({ title, value, icon, loading, accent }: StatCardProps) {
   return (
     <Card>
       <CardHeader>
         <div className="flex items-center justify-between">
           <CardTitle>{title}</CardTitle>
-          <div className="text-[#333]">{icon}</div>
+          <div className={accent ? 'text-amber-600' : 'text-stone-300'}>{icon}</div>
         </div>
-        {loading ? <Skeleton className="h-8 w-28 mt-1" /> : <CardValue>{value}</CardValue>}
+        {loading ? (
+          <Skeleton className="h-8 w-28 mt-1" />
+        ) : (
+          <CardValue className={accent ? 'text-amber-700' : undefined}>{value}</CardValue>
+        )}
       </CardHeader>
     </Card>
   )
@@ -83,7 +86,7 @@ function ChartCard({
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-[#888] text-sm font-medium">{title}</CardTitle>
+        <CardTitle>{title}</CardTitle>
       </CardHeader>
       <CardContent>
         {loading ? <Skeleton className="h-48 w-full" /> : children}
@@ -127,7 +130,6 @@ export function DashboardPage() {
     : []
 
   // ── Chart data (Cost per Request) ───────────────────────────────────────────
-  // Sort by timestamp, assign 1-based integer x for clean axis labels
   const allSorted = [...requests]
     .map((r, i) => ({ ...r, idx: i }))
     .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
@@ -155,15 +157,16 @@ export function DashboardPage() {
     { name: 'Cache Hit', value: hitRate },
     { name: 'Miss', value: 100 - hitRate },
   ]
-  const DONUT_COLORS = ['#22c55e', '#1f1f1f']
+  // Light-adapted: green hit, stone miss
+  const DONUT_COLORS = ['#16A34A', '#E7E5E4']
 
   return (
     <div className="p-4 md:p-6 space-y-6 max-w-6xl mx-auto">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-lg font-semibold text-[#ededed]">Analytics Dashboard</h1>
-          <p className="text-sm text-[#888] mt-0.5">Gateway-wide statistics</p>
+          <h1 className="text-xl font-semibold text-stone-900">Analytics Dashboard</h1>
+          <p className="text-sm text-stone-500 mt-0.5">Gateway-wide statistics</p>
         </div>
         <Button
           variant="outline"
@@ -200,12 +203,14 @@ export function DashboardPage() {
           value={stats ? `$${stats.total_cost_saved_usd.toFixed(6)}` : '—'}
           icon={<TrendingUp className="w-4 h-4" />}
           loading={loading}
+          accent
         />
         <StatCard
           title="Cache Hit Rate"
           value={stats ? `${hitRate}%` : '—'}
           icon={<Zap className="w-4 h-4" />}
           loading={loading}
+          accent
         />
       </div>
 
@@ -215,23 +220,24 @@ export function DashboardPage() {
         <ChartCard title="Requests by Model" loading={loading}>
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={modelData} barSize={36}>
-              <CartesianGrid vertical={false} stroke="#1a1a1a" />
+              <CartesianGrid vertical={false} stroke="#F5F5F4" />
               <XAxis
                 dataKey="name"
-                tick={{ fill: '#555', fontSize: 12 }}
+                tick={{ fill: '#A8A29E', fontSize: 12 }}
                 axisLine={false}
                 tickLine={false}
               />
               <YAxis
-                tick={{ fill: '#555', fontSize: 12 }}
+                tick={{ fill: '#A8A29E', fontSize: 12 }}
                 axisLine={false}
                 tickLine={false}
                 width={36}
               />
-              <Tooltip content={<ChartTooltip />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
+              <Tooltip content={<ChartTooltip />} cursor={{ fill: 'rgba(0,0,0,0.03)' }} />
               <Bar dataKey="requests" radius={[4, 4, 0, 0]}>
-                <Cell fill="#a78bfa" />
-                <Cell fill="#60a5fa" />
+                {/* Groq: amber, Gemini: blue */}
+                <Cell fill="#D97706" />
+                <Cell fill="#2563EB" />
               </Bar>
             </BarChart>
           </ResponsiveContainer>
@@ -262,8 +268,7 @@ export function DashboardPage() {
                   y="50%"
                   textAnchor="middle"
                   dominantBaseline="middle"
-                  className="fill-[#ededed]"
-                  style={{ fontSize: 20, fontWeight: 600, fill: '#ededed' }}
+                  style={{ fontSize: 20, fontWeight: 600, fill: '#1C1917' }}
                 >
                   {hitRate}%
                 </text>
@@ -271,13 +276,13 @@ export function DashboardPage() {
             </ResponsiveContainer>
             <div className="space-y-2">
               {donutData.map((d, i) => (
-                <div key={d.name} className="flex items-center gap-2 text-xs text-[#888]">
+                <div key={d.name} className="flex items-center gap-2 text-xs text-stone-500">
                   <span
                     className="w-2.5 h-2.5 rounded-sm inline-block"
                     style={{ background: DONUT_COLORS[i] }}
                   />
                   {d.name}
-                  <span className="text-[#ededed] font-medium ml-auto pl-4">{d.value}%</span>
+                  <span className="text-stone-800 font-medium ml-auto pl-4">{d.value}%</span>
                 </div>
               ))}
             </div>
@@ -288,21 +293,21 @@ export function DashboardPage() {
       {/* Scatter chart – Cost per Request */}
       <ChartCard title="Cost per Request (µ$)" loading={loading}>
         {requests.length === 0 ? (
-          <div className="flex items-center justify-center h-48 text-sm text-[#555]">
+          <div className="flex items-center justify-center h-48 text-sm text-stone-400">
             No request data available
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={220}>
             <ComposedChart margin={{ bottom: 16 }}>
-              <CartesianGrid vertical={false} stroke="#1a1a1a" />
+              <CartesianGrid vertical={false} stroke="#F5F5F4" />
               <XAxis
                 type="number"
                 dataKey="x"
                 name="Request #"
-                tick={{ fill: '#555', fontSize: 11 }}
+                tick={{ fill: '#A8A29E', fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
-                label={{ value: 'Request #', position: 'insideBottom', offset: -4, fill: '#444', fontSize: 11 }}
+                label={{ value: 'Request #', position: 'insideBottom', offset: -4, fill: '#A8A29E', fontSize: 11 }}
                 domain={[1, requests.length]}
                 allowDuplicatedCategory={false}
                 tickCount={Math.min(requests.length, 10)}
@@ -312,28 +317,28 @@ export function DashboardPage() {
                 type="number"
                 dataKey="y"
                 name="Cost (µ$)"
-                tick={{ fill: '#555', fontSize: 11 }}
+                tick={{ fill: '#A8A29E', fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
                 width={44}
               />
               <ZAxis range={[50, 50]} />
               <Tooltip
-                cursor={{ strokeDasharray: '3 3', stroke: '#333' }}
+                cursor={{ strokeDasharray: '3 3', stroke: '#E7E5E4' }}
                 content={({ active, payload }) => {
                   if (!active || !payload?.length) return null
                   const d = payload[0].payload as { x: number; y: number; label: string; model: string }
-                  const isHit = payload[0].fill === '#22c55e' || payload[0].stroke === '#22c55e'
+                  const isHit = payload[0].stroke === '#16A34A'
                   return (
-                    <div className="rounded-md border border-[#262626] bg-[#0f0f0f] px-3 py-2 text-xs shadow-xl space-y-1">
-                      <p className="text-[#555]">Request #{d.x} &middot; {d.label}</p>
-                      <p style={{ color: isHit ? '#22c55e' : '#a78bfa' }}>
+                    <div className="rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs shadow-lg space-y-1">
+                      <p className="text-stone-400">Request #{d.x} &middot; {d.label}</p>
+                      <p style={{ color: isHit ? '#16A34A' : '#9333EA' }}>
                         {isHit ? '● Cache Hit' : '● Cache Miss'}
                       </p>
-                      <p className="text-[#ededed] font-medium">
+                      <p className="text-stone-800 font-medium">
                         Cost: {d.y.toFixed(6)} µ$
                       </p>
-                      <p className="text-[#888]">Model: {d.model}</p>
+                      <p className="text-stone-500">Model: {d.model}</p>
                     </div>
                   )
                 }}
@@ -341,17 +346,19 @@ export function DashboardPage() {
               <Legend
                 wrapperStyle={{ fontSize: 12, paddingTop: 8 }}
                 formatter={(value) => (
-                  <span style={{ color: value === 'Cache Hit' ? '#22c55e' : '#a78bfa' }}>{value}</span>
+                  <span style={{ color: value === 'Cache Hit' ? '#16A34A' : '#9333EA', fontSize: 12 }}>
+                    {value}
+                  </span>
                 )}
               />
               <Line
                 data={scatterAllHits}
                 dataKey="y"
                 name="Cache Hit"
-                stroke="#22c55e"
+                stroke="#16A34A"
                 strokeWidth={1.5}
-                dot={{ r: 4, fill: '#22c55e', strokeWidth: 0 }}
-                activeDot={{ r: 6, fill: '#22c55e', strokeWidth: 0 }}
+                dot={{ r: 4, fill: '#16A34A', strokeWidth: 0 }}
+                activeDot={{ r: 6, fill: '#16A34A', strokeWidth: 0 }}
                 type="monotone"
                 legendType="circle"
               />
@@ -359,10 +366,10 @@ export function DashboardPage() {
                 data={scatterAllMisses}
                 dataKey="y"
                 name="Cache Miss"
-                stroke="#a78bfa"
+                stroke="#9333EA"
                 strokeWidth={1.5}
-                dot={{ r: 4, fill: '#a78bfa', strokeWidth: 0 }}
-                activeDot={{ r: 6, fill: '#a78bfa', strokeWidth: 0 }}
+                dot={{ r: 4, fill: '#9333EA', strokeWidth: 0 }}
+                activeDot={{ r: 6, fill: '#9333EA', strokeWidth: 0 }}
                 type="monotone"
                 legendType="circle"
               />

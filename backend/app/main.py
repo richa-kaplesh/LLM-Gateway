@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from app.models.schemas import GatewayRequest, GatewayResponse, CostSummary, HealthCheck
+from app.models.schemas import GatewayRequest, GatewayResponse, HealthCheck
 from app.router.router import route
 from app.tracker.tracker import tracker
 from app.core.config import get_settings
@@ -9,10 +9,7 @@ from google import genai
 
 settings = get_settings()
 
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.VERSION
-)
+app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,33 +31,23 @@ async def health_check():
         groq_available = False
 
     try:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
+        genai.Client(api_key=settings.GEMINI_API_KEY)
     except Exception:
         gemini_available = False
 
-    return HealthCheck(
-        status="ok",
-        groq_available=groq_available,
-        gemini_available=gemini_available
-    )
+    return HealthCheck(status="ok", groq_available=groq_available, gemini_available=gemini_available)
 
 
 @app.post("/query", response_model=GatewayResponse)
 async def handle_query(request: GatewayRequest):
     try:
-        response = await route(
-            query=request.query,
-            user_id=request.user_id
-        )
+        response = await route(request)
 
         tracker.log(
             user_id=request.user_id,
-            query=request.query,
+            conversation_id=request.conversation_id,
             response=response
         )
-
-        print("TRACKER LOGS:", len(tracker.logs))
-        print("LAST LOG COST:", tracker.logs[-1].cost_usd if tracker.logs else "empty")
 
         return response
 
@@ -76,6 +63,7 @@ async def global_stats():
 @app.get("/stats/user/{user_id}")
 async def user_stats(user_id: str):
     return tracker.get_user_stats(user_id)
+
 
 @app.get("/stats/requests")
 async def request_history():

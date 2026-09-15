@@ -20,3 +20,30 @@ class TokenBucket:
             self.tokens-=amount
             return True
         return False
+
+provider_buckets = {
+    "groq": TokenBucket(capacity=30, refill_rate=30/60),
+    "gemini": TokenBucket(capacity=15, refill_rate=15/60),
+}
+
+def select_provider():
+    if provider_buckets["groq"].try_consume():
+        return "groq"
+    elif provider_buckets["gemini"].try_consume():
+        return "gemini"
+    else:
+        return None
+
+
+conversation_provider_map: dict[str, str] = {}
+
+
+def get_provider_for_conversation(conversation_id: str):
+    if conversation_id in conversation_provider_map:
+        return conversation_provider_map[conversation_id]
+
+    provider = select_provider()
+    if provider is not None:
+        conversation_provider_map[conversation_id] = provider
+    return provider
+

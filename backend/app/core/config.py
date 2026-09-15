@@ -6,8 +6,8 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str
     GEMINI_API_KEY: str
 
-    GROQ_MODEL: str = "llama-3.1-8b-instant"
-    GEMINI_MODEL: str = "gemini-1.5-flash"
+    GROQ_MODEL: str = "openai/gpt-oss-20b"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
 
     GROQ_INPUT_COST_PER_MILLION: float = 0.15
     GROQ_OUTPUT_COST_PER_MILLION: float = 0.60

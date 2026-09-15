@@ -9,13 +9,14 @@ export default function App() {
     <BrowserRouter>
       <Toaster
         position="top-right"
-        theme="dark"
+        theme="light"
         toastOptions={{
           style: {
-            background: '#111',
-            border: '1px solid #262626',
-            color: '#ededed',
+            background: '#FFFFFF',
+            border: '1px solid #E7E5E4',
+            color: '#1C1917',
             fontSize: '13px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
           },
         }}
       />

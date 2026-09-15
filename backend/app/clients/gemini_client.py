@@ -16,6 +16,7 @@ def calculate_cost(prompt_tokens: int, output_tokens: int) -> float:
     return input_cost + output_cost
 
 
+
 def _parse_args(raw):
     """OpenAI-style tool_calls store arguments as a JSON string. Gemini
     wants a plain dict. Handle both in case the caller already parsed it."""
@@ -61,31 +62,26 @@ def convert_messages(messages: list[dict]):
 
         elif role == "tool":
             contents.append(types.Content(
-                role="tool",
+                role="user",
                 parts=[types.Part.from_function_response(
                     name=msg.get("name", "unknown_function"),
                     response={"result": msg["content"]}
                 )]
-            ))
+                ))
 
     return contents, system_instruction
 
 
-def convert_tools(tools: list[dict] | None):
-    """OpenAI shape: [{"type": "function", "function": {name, description, parameters}}]
-    Gemini shape: Tool(function_declarations=[FunctionDeclaration(...)])"""
-    if not tools:
+def convert_tool_choice(tool_choice: str | None):
+    if tool_choice is None:
         return None
 
-    declarations = [
-        types.FunctionDeclaration(
-            name=t["function"]["name"],
-            description=t["function"].get("description", ""),
-            parameters=t["function"].get("parameters", {})
-        )
-        for t in tools
-    ]
-    return types.Tool(function_declarations=declarations)
+    mode_map = {"auto": "AUTO", "none": "NONE", "required": "ANY"}
+    if tool_choice not in mode_map:
+        raise ValueError(f"Unsupported tool_choice value: {tool_choice!r}")
+
+    mode = mode_map[tool_choice]
+    return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode=mode))
 
 
 def convert_tool_choice(tool_choice: str | None):
@@ -114,6 +110,23 @@ def normalize_tool_calls(function_calls):
         }
         for i, call in enumerate(function_calls)
     ]
+
+def convert_tools(tools: list[dict] | None):
+    """OpenAI shape: [{"type": "function", "function": {name, description, parameters}}]
+    Gemini shape: Tool(function_declarations=[FunctionDeclaration(...)])"""
+    if not tools:
+        return None
+
+    declarations = [
+        types.FunctionDeclaration(
+            name=t["function"]["name"],
+            description=t["function"].get("description", ""),
+            parameters=t["function"].get("parameters", {})
+        )
+        for t in tools
+    ]
+    return types.Tool(function_declarations=declarations)
+
 
 
 async def complete(request: GatewayRequest) -> GatewayResponse:

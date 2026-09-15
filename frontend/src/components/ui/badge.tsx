@@ -7,13 +7,12 @@ const badgeVariants = cva(
   {
     variants: {
       variant: {
-        default: 'border-[#333] bg-[#1a1a1a] text-[#ededed]',
-        groq: 'border-violet-500/30 bg-violet-500/10 text-violet-300',
-        gemini: 'border-blue-500/30 bg-blue-500/10 text-blue-300',
-        simple: 'border-green-500/30 bg-green-500/10 text-green-300',
-        complex: 'border-orange-500/30 bg-orange-500/10 text-orange-300',
-        cached: 'border-green-500/30 bg-green-500/10 text-green-300',
-        uncached: 'border-[#333] bg-[#1a1a1a] text-[#888]',
+        default: 'border-stone-200 bg-stone-100 text-stone-700',
+        groq: 'border-amber-200 bg-amber-50 text-amber-800',
+        gemini: 'border-blue-200 bg-blue-50 text-blue-800',
+        tool: 'border-violet-200 bg-violet-50 text-violet-800',
+        cached: 'border-green-200 bg-green-50 text-green-800',
+        uncached: 'border-stone-200 bg-stone-100 text-stone-500',
       },
     },
     defaultVariants: {

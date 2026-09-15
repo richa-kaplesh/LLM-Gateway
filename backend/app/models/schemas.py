@@ -3,18 +3,15 @@ from typing import Optional
 from enum import Enum
 
 
-class ComplexityLevel(str, Enum):
-    SIMPLE = "simple"
-    COMPLEX = "complex"
 
 
 class GatewayRequest(BaseModel):
-    model: str
+    conversation_id: str
+    user_id: str
     messages: list[dict]
     tools: Optional[list[dict]] = None
     tool_choice: Optional[str] = None
     stream: bool = False
-    user_id: str
 
 
 class GatewayResponse(BaseModel):
