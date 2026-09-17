@@ -29,8 +29,9 @@ class CostSummary(BaseModel):
     total_requests: int
     total_cost_usd: float
     cache_hits: int
+    cache_hit_rate: float
     cost_saved_usd: float
-
+    avg_latency_ms: float
 
 class HealthCheck(BaseModel):
     status: str

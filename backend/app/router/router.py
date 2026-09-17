@@ -2,6 +2,7 @@ from app.clients import groq_client, gemini_client
 from app.cache.cache import cache
 from app.models.schemas import GatewayRequest, GatewayResponse
 from app.router.bucket import get_provider_for_conversation, conversation_provider_map
+from app.clients.exceptions import InvalidRequestError
 
 CLIENTS = {"groq": groq_client, "gemini": gemini_client}
 
@@ -11,10 +12,10 @@ def _other_provider(provider: str) -> str:
 
 
 async def route(request: GatewayRequest) -> GatewayResponse:
-    use_cache = request.tools is None  # never cache tool-calling turns
+    use_cache = request.tools is None
 
     if use_cache:
-        cached = cache.get(request)
+        cached = await cache.get(request)
         if cached:
             return cached
 
@@ -24,11 +25,15 @@ async def route(request: GatewayRequest) -> GatewayResponse:
 
     try:
         response = await CLIENTS[provider].complete(request)
+    except InvalidRequestError:
+        raise
     except Exception as primary_error:
         fallback_provider = _other_provider(provider)
         try:
             response = await CLIENTS[fallback_provider].complete(request)
-            conversation_provider_map[request.conversation_id] = fallback_provider  # re-pin
+            conversation_provider_map[request.conversation_id] = fallback_provider
+        except InvalidRequestError:
+            raise
         except Exception as fallback_error:
             raise Exception(
                 f"Both providers failed. Primary ({provider}): {primary_error}. "
@@ -36,6 +41,6 @@ async def route(request: GatewayRequest) -> GatewayResponse:
             )
 
     if use_cache:
-        cache.set(request, response)
+        await cache.set(request, response)
 
     return response

@@ -2,7 +2,6 @@ fastapi
 uvicorn
 groq
 google-genai
-sentence-transformers
 numpy
 pydantic-settings
 python-dotenv
