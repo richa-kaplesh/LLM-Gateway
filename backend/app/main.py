@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from app.models.schemas import GatewayRequest, GatewayResponse, HealthCheck
+from app.models.schemas import GatewayRequest, GatewayResponse, CostSummary, HealthCheck
 from app.router.router import route
 from app.tracker.tracker import tracker
 from app.core.config import get_settings
@@ -60,9 +60,12 @@ async def global_stats():
     return tracker.get_global_stats()
 
 
-@app.get("/stats/user/{user_id}")
+@app.get("/stats/user/{user_id}", response_model=CostSummary)
 async def user_stats(user_id: str):
-    return tracker.get_user_stats(user_id)
+    stats = tracker.get_user_stats(user_id)
+    if stats is None:
+        raise HTTPException(status_code=404, detail=f"No requests found for user '{user_id}'")
+    return stats
 
 
 @app.get("/stats/requests")

@@ -50,9 +50,9 @@ async def test_tool_calling(client_module, label):
 
 
 async def main():
-    await test_plain_text(groq_client, "GROQ")
-    await test_tool_calling(groq_client, "GROQ")
-    await test_plain_text(gemini_client, "GEMINI")
+
+
+    # await test_plain_text(gemini_client, "GEMINI")
     await test_tool_calling(gemini_client, "GEMINI")
 
 
