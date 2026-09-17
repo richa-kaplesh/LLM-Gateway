@@ -5,6 +5,7 @@ from functools import lru_cache
 class Settings(BaseSettings):
     GROQ_API_KEY: str
     GEMINI_API_KEY: str
+    JINA_API_KEY: str
 
     GROQ_MODEL: str = "openai/gpt-oss-20b"
     GEMINI_MODEL: str = "gemini-3.8-flash"
@@ -17,6 +18,7 @@ class Settings(BaseSettings):
 
     CACHE_SIMILARITY_THRESHOLD: float = 0.70
     CACHE_MAX_SIZE: int = 100
+    
 
     APP_NAME: str = "LLM Gateway"
     VERSION: str = "1.0.0"

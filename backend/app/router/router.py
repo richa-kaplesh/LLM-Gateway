@@ -15,7 +15,7 @@ async def route(request: GatewayRequest) -> GatewayResponse:
     use_cache = request.tools is None
 
     if use_cache:
-        cached = await cache.get(request)
+        cached = cache.get(request)
         if cached:
             return cached
 
@@ -41,6 +41,6 @@ async def route(request: GatewayRequest) -> GatewayResponse:
             )
 
     if use_cache:
-        await cache.set(request, response)
+        cache.set(request, response)
 
     return response
