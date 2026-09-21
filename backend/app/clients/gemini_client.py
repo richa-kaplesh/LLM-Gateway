@@ -4,6 +4,8 @@ from google import genai
 from google.genai import types
 from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
+from google.genai import errors as genai_errors
+from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError
 
 settings = get_settings()
 
@@ -175,9 +177,12 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
             cache_hit=False
         )
 
+    except genai_errors.ClientError as e:
+        code = getattr(e, "code", None)
+        if code == 429:
+            raise ProviderUnavailableError("Gemini quota exceeded")
+        raise InvalidRequestError(f"Gemini rejected the request: {str(e)}")
+    except genai_errors.ServerError as e:
+        raise ProviderUnavailableError(f"Gemini server error: {str(e)}")
     except Exception as e:
-        if "quota" in str(e).lower():
-            raise Exception("Gemini quota exceeded")
-        if "connection" in str(e).lower():
-            raise Exception("Gemini connection failed")
-        raise Exception(f"Gemini error: {str(e)}")
+        raise ProviderUnavailableError(f"Gemini error: {str(e)}")
