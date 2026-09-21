@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     GEMINI_INPUT_COST_PER_MILLION: float = 0.075
     GEMINI_OUTPUT_COST_PER_MILLION: float = 0.30
 
-    CACHE_SIMILARITY_THRESHOLD: float = 0.70
+    CACHE_SIMILARITY_THRESHOLD: float =  0.90 #0.70 
     CACHE_MAX_SIZE: int = 100
     
 
