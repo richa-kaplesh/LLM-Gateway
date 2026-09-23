@@ -12,7 +12,7 @@ def _other_provider(provider: str) -> str:
 
 
 async def route(request: GatewayRequest) -> GatewayResponse:
-    use_cache = request.tools is None
+    use_cache = request.tools is None and not request.is_tool_related
 
     if use_cache:
         cached = cache.get(request)

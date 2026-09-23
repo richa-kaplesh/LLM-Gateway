@@ -12,6 +12,7 @@ class GatewayRequest(BaseModel):
     tools: Optional[list[dict]] = None
     tool_choice: Optional[str] = None
     stream: bool = False
+    is_tool_related: bool = False
 
 
 class GatewayResponse(BaseModel):
