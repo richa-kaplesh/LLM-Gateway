@@ -1,4 +1,9 @@
 import time
+import random
+
+
+GROQ_WEIGHT = 30
+GEMINI_WEIGHT = 15
 
 class TokenBucket:
     def __init__(self, capacity:float, refill_rate:float):
@@ -27,13 +32,21 @@ provider_buckets = {
 }
 
 def select_provider():
-    if provider_buckets["groq"].try_consume():
-        return "groq"
-    elif provider_buckets["gemini"].try_consume():
-        return "gemini"
+    total = GROQ_WEIGHT + GEMINI_WEIGHT
+    roll = random.uniform(0, total)
+
+    if roll < GROQ_WEIGHT:
+        first, second = "groq", "gemini"
+    else:
+        first, second = "gemini", "groq"
+
+    if provider_buckets[first].try_consume():
+        return first
+    elif provider_buckets[second].try_consume():
+        return second
     else:
         return None
-
+   
 
 conversation_provider_map: dict[str, str] = {}
 
@@ -46,4 +59,5 @@ def get_provider_for_conversation(conversation_id: str):
     if provider is not None:
         conversation_provider_map[conversation_id] = provider
     return provider
+
 
