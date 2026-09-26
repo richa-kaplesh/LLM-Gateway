@@ -6,6 +6,9 @@ from app.tracker.tracker import tracker
 from app.core.config import get_settings
 import groq
 from google import genai
+from app.experiments.schema import ExperimentRun
+from app.experiments.store import load_runs, save_run
+from app.router.circuit_breaker import breakers
 
 settings = get_settings()
 
@@ -80,3 +83,15 @@ async def request_history():
         }
         for log in tracker.logs
     ]
+
+@app.get("/experiments")
+async def get_experiments():
+    return load_runs()
+
+@app.post("/experiments")
+async def log_experiment(run: ExperimentRun):
+    return save_run(run)
+
+@app.get("/breakers")
+async def breaker_status():
+    return {name: b.snapshot() for name, b in breakers.items()}
