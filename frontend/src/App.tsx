@@ -3,6 +3,7 @@ import { Toaster } from 'sonner'
 import { Layout } from '@/components/Layout'
 import { QueryPage } from '@/pages/QueryPage'
 import { DashboardPage } from '@/pages/DashboardPage'
+import { ExperimentsPage } from '@/pages/ExperimentsPage'
 
 export default function App() {
   return (
@@ -24,6 +25,7 @@ export default function App() {
         <Route element={<Layout />}>
           <Route path="/" element={<QueryPage />} />
           <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/experiments" element={<ExperimentsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

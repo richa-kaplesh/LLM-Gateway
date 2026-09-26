@@ -1,10 +1,11 @@
 import { NavLink } from 'react-router-dom'
-import { MessageSquare, BarChart2, Zap } from 'lucide-react'
+import { MessageSquare, BarChart2, Zap, FlaskConical } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const navItems = [
   { to: '/', label: 'Query', icon: MessageSquare },
   { to: '/dashboard', label: 'Dashboard', icon: BarChart2 },
+  { to: '/experiments', label: 'Experiments', icon: FlaskConical },
 ]
 
 export function Sidebar() {

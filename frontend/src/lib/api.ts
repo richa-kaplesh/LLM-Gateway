@@ -117,6 +117,52 @@ export async function fetchGlobalStats(): Promise<GlobalStats> {
   }
 }
 
+// ── Experiments ───────────────────────────────────────────────────────────────
+
+export interface ExperimentRecord {
+  name: string
+  category: string
+  description: string
+  metrics: Record<string, number>
+  timestamp: string
+}
+
+export async function fetchExperiments(): Promise<ExperimentRecord[]> {
+  const res = await fetch(`${API_BASE}/experiments`)
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText)
+    throw new Error(detail || `Request failed with status ${res.status}`)
+  }
+
+  const data = await res.json()
+  if (!Array.isArray(data)) return []
+  return data as ExperimentRecord[]
+}
+
+// ── Circuit breaker status ─────────────────────────────────────────────────────
+
+export type BreakerState = 'closed' | 'open' | 'half_open'
+
+export interface BreakerInfo {
+  state: BreakerState
+  consecutive_failures: number
+}
+
+export type BreakerStatusMap = Record<string, BreakerInfo>
+
+export async function fetchBreakerStatus(): Promise<BreakerStatusMap> {
+  const res = await fetch(`${API_BASE}/breakers`)
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText)
+    throw new Error(detail || `Request failed with status ${res.status}`)
+  }
+
+  const data = await res.json()
+  return data as BreakerStatusMap
+}
+
 // ── Per-request records ────────────────────────────────────────────────────────
 
 export interface RequestRecord {
