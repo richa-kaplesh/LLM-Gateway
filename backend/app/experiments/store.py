@@ -1,6 +1,6 @@
 import json, os
 from datetime import datetime
-from app.experiments.schemas import ExperimentRun
+from app.experiments.schema import ExperimentRun
 
 _PATH = os.path.join(os.path.dirname(__file__), "experiments.json")
 
