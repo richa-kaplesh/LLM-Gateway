@@ -12,9 +12,12 @@ class CircuitBreaker:
         if self.state == "open":
             if time.time() - self.opened_at >= self.cooldown_seconds:
                 self.state = "half_open"
-                return True             # let exactly one test request through
+                return True 
+            return False  
+        elif self.state == "half_open":         
             return False
-        return True
+        else:
+            return True
 
     def record_success(self):
         self.consecutive_failures = 0

@@ -2,6 +2,7 @@ import time
 import groq
 from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
+from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError
 
 settings = get_settings()
 
@@ -15,7 +16,6 @@ def calculate_cost(prompt_tokens: int, completion_tokens: int) -> float:
 
 
 def normalize_tool_calls(tool_calls):
-  
     if not tool_calls:
         return None
 
@@ -69,8 +69,10 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
         )
 
     except groq.RateLimitError:
-        raise Exception("Groq rate limit hit")
+        raise ProviderUnavailableError("Groq rate limit hit")
     except groq.APIConnectionError:
-        raise Exception("Groq connection failed")
+        raise ProviderUnavailableError("Groq connection failed")
+    except groq.BadRequestError as e:
+        raise InvalidRequestError(f"Groq rejected the request: {str(e)}")
     except Exception as e:
-        raise Exception(f"Groq error: {str(e)}")
+        raise ProviderUnavailableError(f"Groq error: {str(e)}")

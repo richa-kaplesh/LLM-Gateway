@@ -1,20 +1,28 @@
-import json, os
-from datetime import datetime
-from app.experiments.schema import ExperimentRun
+import json, os, tempfile, threading
+from datetime import datetime, timezone
+from app.experiments.schemas import ExperimentRun
 
 _PATH = os.path.join(os.path.dirname(__file__), "experiments.json")
+_lock = threading.Lock()
 
 def load_runs() -> list[dict]:
     if not os.path.exists(_PATH):
         return []
-    with open(_PATH) as f:
-        return json.load(f)
+    try:
+        with open(_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        os.replace(_PATH, _PATH + ".corrupt")   # keep the broken file, don't overwrite it
+        return []
 
 def save_run(run: ExperimentRun) -> dict:
-    runs = load_runs()
     entry = run.model_dump()
-    entry["timestamp"] = datetime.utcnow().isoformat()
-    runs.append(entry)
-    with open(_PATH, "w") as f:
-        json.dump(runs, f, indent=2)
+    entry["timestamp"] = datetime.now(timezone.utc).isoformat()
+    with _lock:                                  # one writer at a time
+        runs = load_runs()
+        runs.append(entry)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_PATH), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(runs, f, indent=2)
+        os.replace(tmp, _PATH)                   # swap the finished file into place
     return entry

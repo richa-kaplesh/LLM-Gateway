@@ -1,0 +1,23 @@
+[
+  {
+    "name": "weighted_provider_selection_v1",
+    "category": "routing",
+    "description": "Replaced always-Groq-first with weighted random selection (30:15). Share numbers are the expected ratio, not measured.",
+    "metrics": { "groq_share_pct": 66.7, "gemini_share_pct": 33.3 },
+    "timestamp": "2026-09-26T05:07:45+00:00"
+  },
+  {
+    "name": "half_open_before_fix",
+    "category": "reliability",
+    "description": "Original breaker: half_open fell through to return True, so every request after cooldown became a probe",
+    "metrics": { "requests_arriving": 10, "probes_let_through": 10 },
+    "timestamp": "2026-09-28T10:00:00+00:00"
+  },
+  {
+    "name": "half_open_after_fix",
+    "category": "reliability",
+    "description": "Fixed breaker: half_open returns False, so only the first request after cooldown is the probe",
+    "metrics": { "requests_arriving": 10, "probes_let_through": 1 },
+    "timestamp": "2026-09-28T10:05:00+00:00"
+  }
+]
