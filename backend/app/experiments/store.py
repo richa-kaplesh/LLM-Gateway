@@ -1,6 +1,6 @@
 import json, os, tempfile, threading
 from datetime import datetime, timezone
-from app.experiments.schemas import ExperimentRun
+from app.experiments.schema import ExperimentRun
 
 _PATH = os.path.join(os.path.dirname(__file__), "experiments.json")
 _lock = threading.Lock()
