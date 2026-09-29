@@ -26,5 +26,13 @@
     "description": "Unified OpenAI-shaped schema was silently dropping Gemini's thought_signature on multi-turn tool calls, causing 400 INVALID_ARGUMENT on turn 2. Fixed by capturing it in normalize_tool_calls (from response.candidates[0].content.parts) and replaying it in convert_messages.",
     "metrics": { "multiturn_tool_calls_before": 0, "multiturn_tool_calls_after": 1 },
     "timestamp": "2026-09-29T13:22:53+00:00"
+  },
+    {
+    "name": "stuck_probe_fix",
+    "category": "reliability",
+    "description": "InvalidRequestError during a half_open probe never called record_success or record_failure, leaving the breaker permanently stuck in half_open. Added record_inconclusive to reset it back to open with a fresh cooldown instead, so a later request gets a genuine test.",
+    "metrics": { "stuck_forever_before": 1, "stuck_forever_after": 0 },
+    "timestamp": "2026-09-29T14:10:00+00:00"
   }
+
 ]

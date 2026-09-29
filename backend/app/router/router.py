@@ -42,6 +42,7 @@ async def route(request: GatewayRequest) -> GatewayResponse:
             breakers[p].record_success()
             return resp
         except InvalidRequestError:
+            breakers[p].record_inconclusive()
             raise
         except Exception:
             breakers[p].record_failure()

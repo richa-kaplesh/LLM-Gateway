@@ -32,4 +32,8 @@ class CircuitBreaker:
     def snapshot(self) -> dict:
         return {"state": self.state, "consecutive_failures": self.consecutive_failures}
 
+    def record_inconclusive(self):
+        if self.state == "half_open":
+            self.state = "open"
+            self.opened_at = time.time()   # restart the cooldown, try again after it
 breakers = {"groq": CircuitBreaker(), "gemini": CircuitBreaker()}
