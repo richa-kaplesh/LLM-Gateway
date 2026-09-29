@@ -58,6 +58,8 @@ async def handle_query(request: GatewayRequest):
         return response
 
     except Exception as e:
+        log.error(f"/query failed: {e}", exc_info=True)
+
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/stats/global")

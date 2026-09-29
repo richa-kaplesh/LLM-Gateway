@@ -9,7 +9,7 @@ from app.router.circuit_breaker import breakers
 CLIENTS = {"groq": groq_client, "gemini": gemini_client}
 
 
-async def _call_with_retry(client_module, request, attempts=2, delay=2.0):
+async def _call_with_retry(client_module, request, attempts=3, delay=2.0):
     last_error = None
     for i in range(attempts):
         try:
