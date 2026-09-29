@@ -48,13 +48,15 @@ def convert_messages(messages: list[dict]):
 
         elif role == "assistant":
             if msg.get("tool_calls"):
-                parts = [
-                    types.Part.from_function_call(
+                parts = []
+                for call in msg["tool_calls"]:
+                    part = types.Part.from_function_call(
                         name=call["function"]["name"],
                         args=_parse_args(call["function"]["arguments"])
                     )
-                    for call in msg["tool_calls"]
-                ]
+                    part.thought_signature =call.get("thought_signature")
+                    parts.append(part)
+                
                 contents.append(types.Content(role="model", parts=parts))
             else:
                 contents.append(types.Content(
@@ -94,24 +96,27 @@ def convert_tool_choice(tool_choice: str | None):
     return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode=mode))
 
 
-def normalize_tool_calls(function_calls):
-    """Convert Gemini's FunctionCall objects into the same OpenAI-shaped
-    dicts groq_client.py should also be producing — so GatewayResponse.tool_calls
-    has ONE consistent shape no matter which provider answered."""
-    if not function_calls:
+def normalize_tool_calls(parts):
+    """parts = response.candidates[0].content.parts — the full list,
+    so we can grab each function call's thought_signature, not just
+    the bare call."""
+    calls = [p for p in parts if p.function_call]
+    if not calls:
         return None
 
-    return [
-        {
+    result = []
+    for i, part in enumerate(calls):
+        call = part.function_call
+        result.append({
             "id": f"call_{i}",
             "type": "function",
             "function": {
                 "name": call.name,
                 "arguments": json.dumps(call.args)
-            }
-        }
-        for i, call in enumerate(function_calls)
-    ]
+            },
+            "thought_signature": part.thought_signature  
+        })
+    return result
 
 def convert_tools(tools: list[dict] | None):
     """OpenAI shape: [{"type": "function", "function": {name, description, parameters}}]
@@ -164,7 +169,7 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
 
         has_calls = bool(response.function_calls)
         answer = None if has_calls else response.text
-        tool_calls = normalize_tool_calls(response.function_calls) if has_calls else None
+        tool_calls = normalize_tool_calls(response.candidates[0].content.parts) if has_calls else None
         finish_reason = response.candidates[0].finish_reason if response.candidates else None
 
         return GatewayResponse(
