@@ -19,5 +19,12 @@
     "description": "Fixed breaker: half_open returns False, so only the first request after cooldown is the probe",
     "metrics": { "requests_arriving": 10, "probes_let_through": 1 },
     "timestamp": "2026-09-28T10:05:00+00:00"
+  },
+  {
+    "name": "gemini_thought_signature_fix",
+    "category": "adapter",
+    "description": "Unified OpenAI-shaped schema was silently dropping Gemini's thought_signature on multi-turn tool calls, causing 400 INVALID_ARGUMENT on turn 2. Fixed by capturing it in normalize_tool_calls (from response.candidates[0].content.parts) and replaying it in convert_messages.",
+    "metrics": { "multiturn_tool_calls_before": 0, "multiturn_tool_calls_after": 1 },
+    "timestamp": "2026-09-29T13:22:53+00:00"
   }
 ]
