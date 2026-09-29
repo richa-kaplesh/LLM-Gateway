@@ -48,12 +48,18 @@ async def health_check():
 async def handle_query(request: GatewayRequest):
     try:
         response = await route(request)
-        tracker.log(user_id=request.user_id, conversation_id=request.conversation_id, response=response)
-        return response
-    except Exception as e:
-        log.error(f"[QUERY FAILED] conversation={request.conversation_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
+        tracker.log(
+            user_id=request.user_id,
+            conversation_id=request.conversation_id,
+            response=response
+        )
+
+        return response
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @app.get("/stats/global")
 async def global_stats():
     return tracker.get_global_stats()

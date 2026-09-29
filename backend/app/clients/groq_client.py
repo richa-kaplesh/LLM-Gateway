@@ -73,6 +73,14 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
     except groq.APIConnectionError:
         raise ProviderUnavailableError("Groq connection failed")
     except groq.BadRequestError as e:
+        code = (getattr(e, "body", None) or {}).get("error", {}).get("code")
+        if code == "tool_use_failed":
+            # The model itself produced invalid JSON for its tool call arguments
+            # (usually unescaped quotes in generated code). This is Groq's model
+            # glitching, not a malformed request from us, so it's worth retrying
+            # instead of failing immediately — router._call_with_retry will retry
+            # this call, and fail over to Gemini if it keeps happening.
+            raise ProviderUnavailableError(f"Groq failed to generate a valid tool call: {str(e)}")
         raise InvalidRequestError(f"Groq rejected the request: {str(e)}")
     except Exception as e:
         raise ProviderUnavailableError(f"Groq error: {str(e)}")
