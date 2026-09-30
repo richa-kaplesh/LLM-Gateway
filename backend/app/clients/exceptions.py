@@ -8,3 +8,6 @@ class InvalidRequestError(Exception):
     """The request itself is malformed and will fail against any provider.
     Don't waste a second API call retrying elsewhere."""
     pass
+
+class TooLongError(Exception):
+    pass

@@ -5,9 +5,18 @@ from app.router.bucket import get_provider_for_conversation, conversation_provid
 from app.clients.exceptions import InvalidRequestError
 import asyncio
 from app.router.circuit_breaker import breakers
+import tiktoken
+from app.router.bucket import get_provider_for_conversation, conversation_provider_map, estimate_tokens
+from app.clients.exceptions import TooLongError   # new exception, add it to exceptions.py
+from app.router.bucket import get_provider_for_conversation, conversation_provider_map, estimate_tokens, tpm_buckets
+_encoder = tiktoken.get_encoding("cl100k_base")
 
 CLIENTS = {"groq": groq_client, "gemini": gemini_client}
 
+
+def estimate_tokens(messages: list[dict]) -> int:
+    text = " ".join(m.get("content", "") or "" for m in messages)
+    return len(_encoder.encode(text))
 
 async def _call_with_retry(client_module, request, attempts=3, delay=2.0):
     last_error = None
@@ -22,18 +31,21 @@ async def _call_with_retry(client_module, request, attempts=3, delay=2.0):
                 await asyncio.sleep(delay)
     raise last_error
 
-
 async def route(request: GatewayRequest) -> GatewayResponse:
     use_cache = request.tools is None and not request.is_tool_related
     if use_cache:
         cached = cache.get(request)
         if cached:
             return cached
+    # in route(), before calling select_provider
+    estimated_tokens = estimate_tokens(request.messages)
+    max_capacity = max(tpm_buckets["groq"].capacity, tpm_buckets["gemini"].capacity)
+    if estimated_tokens > max_capacity:
+        raise TooLongError(f"Prompt is too long ({estimated_tokens} tokens) for any configured provider")
 
-    provider = get_provider_for_conversation(request.conversation_id)
+    provider = get_provider_for_conversation(request.conversation_id, estimated_tokens)
     if provider is None:
         raise Exception("Both providers are rate-limited right now. Try again shortly.")
-
     async def _try(p: str):
         if not breakers[p].allow_request():
             raise Exception(f"{p} circuit is open, skipping")

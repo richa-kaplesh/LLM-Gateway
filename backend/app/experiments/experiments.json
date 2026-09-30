@@ -33,6 +33,13 @@
     "description": "InvalidRequestError during a half_open probe never called record_success or record_failure, leaving the breaker permanently stuck in half_open. Added record_inconclusive to reset it back to open with a fresh cooldown instead, so a later request gets a genuine test.",
     "metrics": { "stuck_forever_before": 1, "stuck_forever_after": 0 },
     "timestamp": "2026-09-29T14:10:00+00:00"
+  },
+    {
+    "name": "rpm_tpm_leak_fix",
+    "category": "rate_limiting",
+    "description": "select_provider used 'rpm.try_consume() and tpm.try_consume()' which spent an RPM slot even when the TPM check failed right after, silently leaking provider capacity. Split TokenBucket into can_consume (check) and consume (commit), checking both buckets before spending either. Verified with Groq forced to go first and a deliberately-too-small TPM budget.",
+    "metrics": { "rpm_leaked_per_rejected_request_before": 1, "rpm_leaked_per_rejected_request_after": 0 },
+    "timestamp": "2026-09-29T15:10:00+00:00"
   }
 
 ]

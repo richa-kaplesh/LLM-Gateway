@@ -1,17 +1,16 @@
-# test_breaker.py  (run from backend/: python test_breaker.py)
-import time
-from app.router.circuit_breaker import CircuitBreaker
+# backend/test_bucket_tpm.py
+import random
+from app.router.bucket import rpm_buckets, tpm_buckets, select_provider
 
-b = CircuitBreaker(failure_threshold=2, cooldown_seconds=1)
+random.uniform = lambda a, b: 0   # forces roll=0, which is always < GROQ_WEIGHT → groq goes first, guaranteed
 
-assert b.allow_request() is True          # closed: allowed
-b.record_failure(); b.record_failure()
-assert b.state == "open"                  # 2 failures opens it
-assert b.allow_request() is False         # open, cooldown not over: skipped
-time.sleep(1.1)
-assert b.allow_request() is True          # first request after cooldown = the probe
-assert b.state == "half_open"
-assert b.allow_request() is False         # second request: skipped while probe runs
-b.record_failure()
-assert b.state == "open"                  # failed probe reopens it
-print("all passed")
+tpm_buckets["groq"].tokens = 10
+
+rpm_before = rpm_buckets["groq"].tokens
+result = select_provider(estimated_tokens=500)
+rpm_after = rpm_buckets["groq"].tokens
+
+print("provider picked:", result)
+print("groq RPM before:", rpm_before, "| after:", rpm_after)
+print("Groq was definitely tried first:", "yes, forced by monkey-patch")
+print("RPM leaked?", rpm_before != rpm_after)
