@@ -6,3 +6,4 @@ numpy
 pydantic-settings
 python-dotenv
 httpx
+tiktoken
