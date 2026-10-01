@@ -1,5 +1,6 @@
 import httpx
 import numpy as np
+from collections import OrderedDict
 from app.models.schemas import GatewayRequest, GatewayResponse
 from app.core.config import get_settings
 
@@ -30,8 +31,6 @@ class SemanticCache:
         self.responses: list[GatewayResponse] = []
 
     def _get_embedding(self, text: str) -> np.ndarray:
-        # "text-matching" — comparing query-to-query (symmetric), not
-        # query-to-document like QueryMind's retrieval.query/retrieval.passage
         payload = {"model": _MODEL, "task": "text-matching", "dimensions": _DIM, "input": [text]}
         resp = httpx.post(_EMBED_URL, headers=_headers, json=payload, timeout=30.0)
         if resp.status_code != 200:
@@ -77,4 +76,25 @@ class SemanticCache:
         self.responses.append(response)
 
 
-cache = SemanticCache()
+# ── Scoping: conversation-private caches vs one shared global cache ────────
+conversation_caches: OrderedDict[str, SemanticCache] = OrderedDict()
+global_cache = SemanticCache()
+
+MAX_TRACKED_CONVERSATIONS = 500
+
+
+def get_cache_for(request: GatewayRequest) -> SemanticCache | None:
+    if request.cache_scope == "conversation":
+        conv_id = request.conversation_id
+        if conv_id in conversation_caches:
+            conversation_caches.move_to_end(conv_id)
+        else:
+            conversation_caches[conv_id] = SemanticCache()
+            if len(conversation_caches) > MAX_TRACKED_CONVERSATIONS:
+                conversation_caches.popitem(last=False)
+        return conversation_caches[conv_id]
+
+    if request.cache_scope == "global":
+        return global_cache
+
+    return None

@@ -13,6 +13,7 @@ class GatewayRequest(BaseModel):
     tool_choice: Optional[str] = None
     stream: bool = False
     is_tool_related: bool = False
+    cache_scope: Optional[str] = None   # "conversation" | "global" | None
 
 
 class GatewayResponse(BaseModel):

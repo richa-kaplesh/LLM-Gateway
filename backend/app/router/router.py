@@ -1,17 +1,13 @@
 from app.clients import groq_client, gemini_client
-from app.cache.cache import cache
+from app.cache.cache import get_cache_for
 from app.models.schemas import GatewayRequest, GatewayResponse
-from app.router.bucket import get_provider_for_conversation, conversation_provider_map
-from app.clients.exceptions import InvalidRequestError
+from app.router.bucket import select_provider, tpm_buckets
+from app.clients.exceptions import InvalidRequestError, TooLongError
 import asyncio
 from app.router.circuit_breaker import breakers
 import tiktoken
-from app.clients.exceptions import TooLongError   # new exception, add it to exceptions.py
-from app.router.bucket import select_provider, tpm_buckets
 
 _encoder = tiktoken.get_encoding("cl100k_base")
-
-
 
 CLIENTS = {"groq": groq_client, "gemini": gemini_client}
 
@@ -19,6 +15,7 @@ CLIENTS = {"groq": groq_client, "gemini": gemini_client}
 def estimate_tokens(messages: list[dict]) -> int:
     text = " ".join(m.get("content", "") or "" for m in messages)
     return len(_encoder.encode(text))
+
 
 async def _call_with_retry(client_module, request, attempts=3, delay=2.0):
     last_error = None
@@ -33,20 +30,23 @@ async def _call_with_retry(client_module, request, attempts=3, delay=2.0):
                 await asyncio.sleep(delay)
     raise last_error
 
+
 async def route(request: GatewayRequest) -> GatewayResponse:
-    use_cache = request.tools is None and not request.is_tool_related
-    if use_cache:
+    cache = get_cache_for(request)
+    if cache:
         cached = cache.get(request)
         if cached:
             return cached
+
     estimated_tokens = estimate_tokens(request.messages)
     max_capacity = max(tpm_buckets["groq"].capacity, tpm_buckets["gemini"].capacity)
     if estimated_tokens > max_capacity:
         raise TooLongError(f"Prompt is too long ({estimated_tokens} tokens) for any configured provider")
 
-    provider = select_provider(estimated_tokens) 
+    provider = select_provider(estimated_tokens)
     if provider is None:
         raise Exception("Both providers are rate-limited right now. Try again shortly.")
+
     async def _try(p: str):
         if not breakers[p].allow_request():
             raise Exception(f"{p} circuit is open, skipping")
@@ -69,13 +69,12 @@ async def route(request: GatewayRequest) -> GatewayResponse:
         fallback_provider = _other_provider(provider)
         try:
             response = await _try(fallback_provider)
-            
         except InvalidRequestError:
             raise
         except Exception as fallback_error:
             raise Exception(f"Both providers failed. Primary: {primary_error}. Fallback: {fallback_error}")
 
-    if use_cache:
+    if cache:
         cache.set(request, response)
     return response
 
