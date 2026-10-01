@@ -1,9 +1,11 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from app.models.schemas import GatewayRequest, GatewayResponse, CostSummary, HealthCheck
-from app.router.router import route
+from app.router.router import route, estimate_tokens
 from app.tracker.tracker import tracker
 from app.core.config import get_settings
+from app.core.db import init_pool, close_pool
 import groq
 from google import genai
 from app.experiments.schema import ExperimentRun
@@ -15,7 +17,15 @@ log = logging.getLogger("gateway")
 
 settings = get_settings()
 
-app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_pool()
+    yield
+    await close_pool()
+
+
+app = FastAPI(title=settings.APP_NAME, version=settings.VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,53 +58,51 @@ async def health_check():
 async def handle_query(request: GatewayRequest):
     try:
         response = await route(request)
-
-        tracker.log(
-            user_id=request.user_id,
-            conversation_id=request.conversation_id,
-            response=response
+        await tracker.log(
+            request.user_id, request.conversation_id, response, status="success",
+            cache_scope=request.cache_scope,
+            estimated_tokens=estimate_tokens(request.messages),
         )
-
         return response
 
     except Exception as e:
         log.error(f"/query failed: {e}", exc_info=True)
-
+        await tracker.log(
+            request.user_id, request.conversation_id, None,
+            status="error", error_type=type(e).__name__,
+            cache_scope=request.cache_scope,
+            estimated_tokens=estimate_tokens(request.messages),
+        )
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+
 @app.get("/stats/global")
 async def global_stats():
-    return tracker.get_global_stats()
+    return await tracker.get_global_stats()
 
 
 @app.get("/stats/user/{user_id}", response_model=CostSummary)
 async def user_stats(user_id: str):
-    stats = tracker.get_user_stats(user_id)
+    stats = await tracker.get_user_stats(user_id)
     if stats is None:
         raise HTTPException(status_code=404, detail=f"No requests found for user '{user_id}'")
     return stats
 
 
 @app.get("/stats/requests")
-async def request_history():
-    return [
-        {
-            "timestamp": log.timestamp.isoformat(),
-            "cost_usd": log.cost_usd,
-            "latency_ms": log.latency_ms,
-            "model_used": log.model_used,
-            "cache_hit": log.cache_hit
-        }
-        for log in tracker.logs
-    ]
+async def request_history(limit: int = 200):
+    return await tracker.get_recent_requests(limit)
+
 
 @app.get("/experiments")
 async def get_experiments():
     return load_runs()
 
+
 @app.post("/experiments")
 async def log_experiment(run: ExperimentRun):
     return save_run(run)
+
 
 @app.get("/breakers")
 async def breaker_status():

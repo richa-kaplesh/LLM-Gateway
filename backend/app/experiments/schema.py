@@ -7,3 +7,4 @@ class ExperimentRun(BaseModel):
     description: str
     metrics: dict[str, float]
     timestamp: datetime = None
+

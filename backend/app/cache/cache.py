@@ -59,8 +59,10 @@ class SemanticCache:
             return GatewayResponse(
                 content=cached.content, tool_calls=cached.tool_calls,
                 finish_reason=cached.finish_reason, model_used=cached.model_used,
-                cost_usd=0.0, latency_ms=0.0, cache_hit=True
-            )
+                provider_used=cached.provider_used,
+                cost_usd=0.0, latency_ms=0.0, cache_hit=True,
+                cache_scope=request.cache_scope,
+        )
         return None
 
     def set(self, request: GatewayRequest, response: GatewayResponse) -> None:

@@ -63,6 +63,7 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             model_used=settings.GROQ_MODEL,
+            provider_used="groq",
             cost_usd=cost,
             latency_ms=latency_ms,
             cache_hit=False

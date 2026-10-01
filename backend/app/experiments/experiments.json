@@ -47,6 +47,13 @@
     "description": "Removed conversation_provider_map, a leftover stickiness mechanism that did a worse, accidental version of what the circuit breaker already does properly (only remembered a failure after it happened, per-conversation, with no recovery awareness). Also caught and avoided a double allow_request() bug before shipping: having both select_provider and _try check the breaker would have blocked the exact provider select_provider had just approved, since the first call on an open+expired-cooldown breaker flips it to half_open, and the second call then sees half_open and rejects it.",
     "metrics": { "breaker_checks_per_request_before_fix": 2, "breaker_checks_per_request_after_fix": 1 },
     "timestamp": "2026-09-30T06:00:00+00:00"
+  },
+    {
+    "name": "cache_scope_privacy_fix",
+    "category": "caching",
+    "description": "SemanticCache was a single global instance with no awareness of conversation_id or user. reviewer.py's internal review call (is_tool_related=False, no tools) was cache-eligible, and the cached text included real retrieved document passages plus a draft answer — a semantically similar reviewer call from a different user/document could receive someone else's document content back. Fixed by splitting into per-conversation caches (OrderedDict with LRU eviction, cap 500) and one explicit global cache, gated by a new cache_scope field the caller must opt into (conversation/global/none). Defaults to no caching, so the system fails safe until callers opt in.",
+    "metrics": { "cross_user_cache_leak_possible_before": 1, "cross_user_cache_leak_possible_after": 0 },
+    "timestamp": "2026-10-01T00:00:00+00:00"
   }
 
 ]

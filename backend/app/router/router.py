@@ -3,6 +3,7 @@ from app.cache.cache import get_cache_for
 from app.models.schemas import GatewayRequest, GatewayResponse
 from app.router.bucket import select_provider, tpm_buckets
 from app.clients.exceptions import InvalidRequestError, TooLongError
+from app.tracker.tracker import tracker
 import asyncio
 from app.router.circuit_breaker import breakers
 import tiktoken
@@ -48,19 +49,30 @@ async def route(request: GatewayRequest) -> GatewayResponse:
         raise Exception("Both providers are rate-limited right now. Try again shortly.")
 
     async def _try(p: str):
-        if not breakers[p].allow_request():
+        breaker = breakers[p]
+        state_before = breaker.state
+        allowed = breaker.allow_request()
+        if breaker.state != state_before:
+            await tracker.log_breaker_transition(p, state_before, breaker.state)
+        if not allowed:
             raise Exception(f"{p} circuit is open, skipping")
+
+        state_before = breaker.state
         try:
             resp = await _call_with_retry(CLIENTS[p], request)
-            breakers[p].record_success()
+            breaker.record_success()
             return resp
         except InvalidRequestError:
-            breakers[p].record_inconclusive()
+            breaker.record_inconclusive()
             raise
         except Exception:
-            breakers[p].record_failure()
+            breaker.record_failure()
             raise
+        finally:
+            if breaker.state != state_before:
+                await tracker.log_breaker_transition(p, state_before, breaker.state)
 
+    was_fallback = False
     try:
         response = await _try(provider)
     except InvalidRequestError:
@@ -69,10 +81,13 @@ async def route(request: GatewayRequest) -> GatewayResponse:
         fallback_provider = _other_provider(provider)
         try:
             response = await _try(fallback_provider)
+            was_fallback = True
         except InvalidRequestError:
             raise
         except Exception as fallback_error:
             raise Exception(f"Both providers failed. Primary: {primary_error}. Fallback: {fallback_error}")
+
+    response.was_fallback = was_fallback
 
     if cache:
         cache.set(request, response)

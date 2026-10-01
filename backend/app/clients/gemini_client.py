@@ -177,6 +177,7 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
             tool_calls=tool_calls,
             finish_reason=str(finish_reason) if finish_reason else None,
             model_used=settings.GEMINI_MODEL,
+            provider_used="gemini",
             cost_usd=cost,
             latency_ms=latency_ms,
             cache_hit=False

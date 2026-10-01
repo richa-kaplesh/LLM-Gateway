@@ -19,7 +19,6 @@ class TokenBucket:
         self.tokens = min(self.capacity, self.tokens + coins_earned)
         self.last_refill_time = current_time
 
-    
     def can_consume(self, amount: float = 1) -> bool:
         self._refill()
         return self.tokens >= amount
@@ -28,23 +27,25 @@ class TokenBucket:
         self.tokens -= amount
 
 
-# RPM buckets — unchanged, still counting 1 per request
+# RPM buckets — requests per minute, matching each provider's free-tier RPM limit
 rpm_buckets = {
     "groq": TokenBucket(capacity=30, refill_rate=30/60),
     "gemini": TokenBucket(capacity=15, refill_rate=15/60),
 }
 
-# NEW: TPM buckets — actual token counts. Confirm Gemini's real TPM
-# in AI Studio before trusting this number; 32000 is a placeholder.
+# TPM buckets — actual token counts, a separate ceiling under the RPM one.
+# Confirm Gemini's real TPM in AI Studio before trusting this number; 32000 is a placeholder.
 tpm_buckets = {
     "groq": TokenBucket(capacity=12000, refill_rate=12000/60),
     "gemini": TokenBucket(capacity=32000, refill_rate=32000/60),
 }
 
-from app.router.circuit_breaker import breakers
 
-# bucket.py — select_provider goes back to NOT checking the breaker
 def select_provider(estimated_tokens: int):
+    """Picks a provider by weighted random order, then checks RPM+TPM capacity.
+    Does NOT check the circuit breaker — that happens exactly once, in
+    router.py's _try(), so a request isn't blocked by a probe it itself
+    just triggered (see: double allow_request() bug, found before shipping)."""
     total = GROQ_WEIGHT + GEMINI_WEIGHT
     roll = random.uniform(0, total)
     first, second = ("groq", "gemini") if roll < GROQ_WEIGHT else ("gemini", "groq")
@@ -59,14 +60,3 @@ def select_provider(estimated_tokens: int):
     return None
 
 
-conversation_provider_map: dict[str, str] = {}
-
-
-def get_provider_for_conversation(conversation_id: str, estimated_tokens: int):
-    if conversation_id in conversation_provider_map:
-        return conversation_provider_map[conversation_id]
-
-    provider = select_provider(estimated_tokens)
-    if provider is not None:
-        conversation_provider_map[conversation_id] = provider
-    return provider
