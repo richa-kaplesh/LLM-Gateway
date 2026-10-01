@@ -3,8 +3,6 @@ from typing import Optional
 from enum import Enum
 
 
-
-
 class GatewayRequest(BaseModel):
     conversation_id: str
     user_id: str
@@ -21,9 +19,11 @@ class GatewayResponse(BaseModel):
     tool_calls: Optional[list[dict]] = None
     finish_reason: Optional[str] = None
     model_used: str
+    provider_used: str
     cost_usd: float
     latency_ms: float
     cache_hit: bool
+    was_fallback: bool = False
 
 
 class CostSummary(BaseModel):
@@ -34,6 +34,7 @@ class CostSummary(BaseModel):
     cache_hit_rate: float
     cost_saved_usd: float
     avg_latency_ms: float
+
 
 class HealthCheck(BaseModel):
     status: str
