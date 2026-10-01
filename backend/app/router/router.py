@@ -7,8 +7,11 @@ import asyncio
 from app.router.circuit_breaker import breakers
 import tiktoken
 from app.clients.exceptions import TooLongError   # new exception, add it to exceptions.py
-from app.router.bucket import get_provider_for_conversation, conversation_provider_map,  tpm_buckets
+from app.router.bucket import select_provider, tpm_buckets
+
 _encoder = tiktoken.get_encoding("cl100k_base")
+
+
 
 CLIENTS = {"groq": groq_client, "gemini": gemini_client}
 
@@ -36,13 +39,12 @@ async def route(request: GatewayRequest) -> GatewayResponse:
         cached = cache.get(request)
         if cached:
             return cached
-    # in route(), before calling select_provider
     estimated_tokens = estimate_tokens(request.messages)
     max_capacity = max(tpm_buckets["groq"].capacity, tpm_buckets["gemini"].capacity)
     if estimated_tokens > max_capacity:
         raise TooLongError(f"Prompt is too long ({estimated_tokens} tokens) for any configured provider")
 
-    provider = get_provider_for_conversation(request.conversation_id, estimated_tokens)
+    provider = select_provider(estimated_tokens) 
     if provider is None:
         raise Exception("Both providers are rate-limited right now. Try again shortly.")
     async def _try(p: str):
@@ -67,7 +69,7 @@ async def route(request: GatewayRequest) -> GatewayResponse:
         fallback_provider = _other_provider(provider)
         try:
             response = await _try(fallback_provider)
-            conversation_provider_map[request.conversation_id] = fallback_provider
+            
         except InvalidRequestError:
             raise
         except Exception as fallback_error:

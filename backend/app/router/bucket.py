@@ -41,6 +41,9 @@ tpm_buckets = {
     "gemini": TokenBucket(capacity=32000, refill_rate=32000/60),
 }
 
+from app.router.circuit_breaker import breakers
+
+# bucket.py — select_provider goes back to NOT checking the breaker
 def select_provider(estimated_tokens: int):
     total = GROQ_WEIGHT + GEMINI_WEIGHT
     roll = random.uniform(0, total)
