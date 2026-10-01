@@ -40,6 +40,13 @@
     "description": "select_provider used 'rpm.try_consume() and tpm.try_consume()' which spent an RPM slot even when the TPM check failed right after, silently leaking provider capacity. Split TokenBucket into can_consume (check) and consume (commit), checking both buckets before spending either. Verified with Groq forced to go first and a deliberately-too-small TPM budget.",
     "metrics": { "rpm_leaked_per_rejected_request_before": 1, "rpm_leaked_per_rejected_request_after": 0 },
     "timestamp": "2026-09-29T15:10:00+00:00"
+  },
+    {
+    "name": "bucket_breaker_cleanup",
+    "category": "routing",
+    "description": "Removed conversation_provider_map, a leftover stickiness mechanism that did a worse, accidental version of what the circuit breaker already does properly (only remembered a failure after it happened, per-conversation, with no recovery awareness). Also caught and avoided a double allow_request() bug before shipping: having both select_provider and _try check the breaker would have blocked the exact provider select_provider had just approved, since the first call on an open+expired-cooldown breaker flips it to half_open, and the second call then sees half_open and rejects it.",
+    "metrics": { "breaker_checks_per_request_before_fix": 2, "breaker_checks_per_request_after_fix": 1 },
+    "timestamp": "2026-09-30T06:00:00+00:00"
   }
 
 ]
