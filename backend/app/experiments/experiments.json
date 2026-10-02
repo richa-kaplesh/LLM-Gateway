@@ -54,6 +54,13 @@
     "description": "SemanticCache was a single global instance with no awareness of conversation_id or user. reviewer.py's internal review call (is_tool_related=False, no tools) was cache-eligible, and the cached text included real retrieved document passages plus a draft answer — a semantically similar reviewer call from a different user/document could receive someone else's document content back. Fixed by splitting into per-conversation caches (OrderedDict with LRU eviction, cap 500) and one explicit global cache, gated by a new cache_scope field the caller must opt into (conversation/global/none). Defaults to no caching, so the system fails safe until callers opt in.",
     "metrics": { "cross_user_cache_leak_possible_before": 1, "cross_user_cache_leak_possible_after": 0 },
     "timestamp": "2026-10-01T00:00:00+00:00"
+  },
+    {
+    "name": "conversation_stickiness_restored",
+    "category": "routing",
+    "description": "Removing conversation_provider_map (earlier cleanup) assumed message-history replay made provider stickiness unnecessary, which holds for plain text but not for Gemini's thought_signature on tool calls. QueryMind's agent loop reuses one conversation_id across ~6 steps; without stickiness, a step could land on Groq (no signature) then a later step in the same loop could land on Gemini, which rejects replaying a function-call part with no signature. Restored stickiness via get_provider_for_conversation, built on the fixed can_consume/consume bucket pair, with re-pinning on fallback. Breaker is still checked exactly once, in _try, avoiding the earlier double-check bug.",
+    "metrics": { "multistep_tool_loop_cross_provider_failures_before": 1, "multistep_tool_loop_cross_provider_failures_after": 0 },
+    "timestamp": "2026-10-01T18:00:00+00:00"
   }
 
 ]
