@@ -68,6 +68,13 @@
     "description": "Cost/request tracking previously lived in an in-memory Python list, wiped on every Render restart/redeploy (and free-tier services spin down on idle, making this frequent, not rare). Moved to Postgres (Neon, free persistent tier) via asyncpg. Verified request_logs data survives a service restart.",
     "metrics": { "data_survives_restart_before": 0, "data_survives_restart_after": 1 },
     "timestamp": "2026-10-01T19:00:00+00:00"
+  },
+  {
+    "name": "proper_http_status_codes",
+    "category": "api_design",
+    "description": "Every failure mode (InvalidRequestError, TooLongError, all-providers-rate-limited, genuine server errors) returned a blanket 500, giving callers no way to distinguish 'retry this' from 'never retry this' from 'wait and retry.' Added AllProvidersRateLimitedError and mapped each exception type to its correct HTTP status: 400 for malformed requests, 413 for prompts too long for any provider, 429 for temporary capacity exhaustion, 500 reserved for genuinely unexpected failures. Also scoped log levels so expected rejections (400/413) log at info, not error, keeping the error log reserved for real bugs.",
+    "metrics": { "distinct_error_status_codes_before": 1, "distinct_error_status_codes_after": 4 },
+    "timestamp": "2026-10-02T06:00:00+00:00"
   }
 
 ]

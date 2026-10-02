@@ -67,6 +67,8 @@ async def handle_query(request: GatewayRequest):
         return response
 
     except InvalidRequestError as e:
+        log.info(f"/query rejected (invalid request): {e}")
+
         await tracker.log(request.user_id, request.conversation_id, None,
                            status="error", error_type="InvalidRequestError",
                            cache_scope=request.cache_scope,
@@ -74,13 +76,17 @@ async def handle_query(request: GatewayRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     except TooLongError as e:
+        log.info(f"/query rejected (too long): {e}")
+
         await tracker.log(request.user_id, request.conversation_id, None,
                            status="error", error_type="TooLongError",
                            cache_scope=request.cache_scope,
                            estimated_tokens=estimate_tokens(request.messages))
         raise HTTPException(status_code=413, detail=str(e))
 
-    except AllProvidersRateLimitedError as e:
+    except AllProvidersRateLimitedError as e: 
+        log.warning(f"/query rejected (all providers rate-limited): {e}")
+
         await tracker.log(request.user_id, request.conversation_id, None,
                            status="error", error_type="AllProvidersRateLimitedError",
                            cache_scope=request.cache_scope,
