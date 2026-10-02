@@ -1,7 +1,7 @@
 from app.clients import groq_client, gemini_client
 from app.cache.cache import get_cache_for
 from app.models.schemas import GatewayRequest, GatewayResponse
-from app.router.bucket import select_provider, tpm_buckets
+from app.router.bucket import get_provider_for_conversation, conversation_provider_map, tpm_buckets
 from app.clients.exceptions import InvalidRequestError, TooLongError
 from app.tracker.tracker import tracker
 import asyncio
@@ -44,7 +44,8 @@ async def route(request: GatewayRequest) -> GatewayResponse:
     if estimated_tokens > max_capacity:
         raise TooLongError(f"Prompt is too long ({estimated_tokens} tokens) for any configured provider")
 
-    provider = select_provider(estimated_tokens)
+    provider = get_provider_for_conversation(request.conversation_id, estimated_tokens)
+
     if provider is None:
         raise Exception("Both providers are rate-limited right now. Try again shortly.")
 
@@ -82,6 +83,7 @@ async def route(request: GatewayRequest) -> GatewayResponse:
         try:
             response = await _try(fallback_provider)
             was_fallback = True
+            conversation_provider_map[request.conversation_id] = fallback_provider   # re-pin
         except InvalidRequestError:
             raise
         except Exception as fallback_error:

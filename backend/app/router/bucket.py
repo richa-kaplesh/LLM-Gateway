@@ -59,4 +59,20 @@ def select_provider(estimated_tokens: int):
             return p
     return None
 
+conversation_provider_map: dict[str, str] = {}
 
+def get_provider_for_conversation(conversation_id: str, estimated_tokens: int):
+    sticky = conversation_provider_map.get(conversation_id)
+    if sticky is not None:
+        if (estimated_tokens <= tpm_buckets[sticky].capacity
+                and rpm_buckets[sticky].can_consume()
+                and tpm_buckets[sticky].can_consume(estimated_tokens)):
+            rpm_buckets[sticky].consume()
+            tpm_buckets[sticky].consume(estimated_tokens)
+            return sticky
+        return None   # sticky provider has no room right now
+
+    provider = select_provider(estimated_tokens)
+    if provider is not None:
+        conversation_provider_map[conversation_id] = provider
+    return provider
