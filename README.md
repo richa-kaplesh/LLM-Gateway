@@ -11,26 +11,27 @@ Calling an LLM provider's SDK directly from application code couples that code t
 
 ## Architecture
 
+```
 Client (e.g. QueryMind)
-│
-│ POST /query { conversation_id, user_id, messages, tools?, tool_choice?, cache_scope? }
-▼
+      │
+      │  POST /query  { conversation_id, user_id, messages, tools?, tool_choice?, cache_scope? }
+      ▼
 ┌───────────────────────────────────────────────────┐
-│ LLM Gateway │
-│ │
-│ 1. Semantic cache check (scoped: conversation/global)│
-│ 2. TooLong check — reject if no provider could fit it│
-│ 3. Sticky provider routing + RPM/TPM bucket check │
-│ 4. Circuit breaker check (skip providers known down) │
-│ 5. Provider call, with retry (before first response) │
-│ 6. Fallback to other provider on failure, re-pin │
-│ 7. Cost/latency/breaker-transition tracking (Postgres)│
+│                    LLM Gateway                      │
+│                                                       │
+│  1. Semantic cache check (scoped: conversation/global)│
+│  2. TooLong check — reject if no provider could fit it│
+│  3. Sticky provider routing + RPM/TPM bucket check    │
+│  4. Circuit breaker check (skip providers known down) │
+│  5. Provider call, with retry (before first response) │
+│  6. Fallback to other provider on failure, re-pin     │
+│  7. Cost/latency/breaker-transition tracking (Postgres)│
 └───────────────────────────────────────────────────┘
-│ │
-▼ ▼
-Groq API Gemini API
-(OpenAI-compatible) (native SDK, translated)
-
+      │                           │
+      ▼                           ▼
+  Groq API                   Gemini API
+  (OpenAI-compatible)        (native SDK, translated)
+```
 
 ## Core design decisions
 
@@ -122,12 +123,12 @@ pip install -r requirements.txt
 ```
 
 Create `backend/.env`:
-
+```
 GROQ_API_KEY=...
 GEMINI_API_KEY=...
 JINA_API_KEY=...
-DATABASE_URL=postgresql://... # Neon connection string
-
+DATABASE_URL=postgresql://...   # Neon connection string
+```
 
 Run:
 ```bash
