@@ -12,6 +12,7 @@ from app.experiments.schema import ExperimentRun
 from app.experiments.store import load_runs, save_run
 from app.router.circuit_breaker import breakers
 import logging
+from app.clients.exceptions import InvalidRequestError, TooLongError, AllProvidersRateLimitedError
 
 log = logging.getLogger("gateway")
 
@@ -65,16 +66,34 @@ async def handle_query(request: GatewayRequest):
         )
         return response
 
+    except InvalidRequestError as e:
+        await tracker.log(request.user_id, request.conversation_id, None,
+                           status="error", error_type="InvalidRequestError",
+                           cache_scope=request.cache_scope,
+                           estimated_tokens=estimate_tokens(request.messages))
+        raise HTTPException(status_code=400, detail=str(e))
+
+    except TooLongError as e:
+        await tracker.log(request.user_id, request.conversation_id, None,
+                           status="error", error_type="TooLongError",
+                           cache_scope=request.cache_scope,
+                           estimated_tokens=estimate_tokens(request.messages))
+        raise HTTPException(status_code=413, detail=str(e))
+
+    except AllProvidersRateLimitedError as e:
+        await tracker.log(request.user_id, request.conversation_id, None,
+                           status="error", error_type="AllProvidersRateLimitedError",
+                           cache_scope=request.cache_scope,
+                           estimated_tokens=estimate_tokens(request.messages))
+        raise HTTPException(status_code=429, detail=str(e))
+
     except Exception as e:
         log.error(f"/query failed: {e}", exc_info=True)
-        await tracker.log(
-            request.user_id, request.conversation_id, None,
-            status="error", error_type=type(e).__name__,
-            cache_scope=request.cache_scope,
-            estimated_tokens=estimate_tokens(request.messages),
-        )
+        await tracker.log(request.user_id, request.conversation_id, None,
+                           status="error", error_type=type(e).__name__,
+                           cache_scope=request.cache_scope,
+                           estimated_tokens=estimate_tokens(request.messages))
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/stats/global")
 async def global_stats():

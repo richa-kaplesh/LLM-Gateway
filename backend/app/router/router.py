@@ -6,6 +6,7 @@ from app.clients.exceptions import InvalidRequestError, TooLongError
 from app.tracker.tracker import tracker
 import asyncio
 from app.router.circuit_breaker import breakers
+from app.clients.exceptions import InvalidRequestError, TooLongError, AllProvidersRateLimitedError
 import tiktoken
 
 _encoder = tiktoken.get_encoding("cl100k_base")
@@ -47,7 +48,7 @@ async def route(request: GatewayRequest) -> GatewayResponse:
     provider = get_provider_for_conversation(request.conversation_id, estimated_tokens)
 
     if provider is None:
-        raise Exception("Both providers are rate-limited right now. Try again shortly.")
+        raise AllProvidersRateLimitedError("Both providers are rate-limited right now. Try again shortly.")
 
     async def _try(p: str):
         breaker = breakers[p]
