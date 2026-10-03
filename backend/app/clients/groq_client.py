@@ -6,7 +6,7 @@ from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError
 
 settings = get_settings()
 
-client = groq.Groq(api_key=settings.GROQ_API_KEY)
+client = groq.AsyncGroq(api_key=settings.GROQ_API_KEY)
 
 
 def calculate_cost(prompt_tokens: int, completion_tokens: int) -> float:
@@ -34,7 +34,7 @@ def normalize_tool_calls(tool_calls):
 
 async def complete(request: GatewayRequest) -> GatewayResponse:
     try:
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         kwargs = {
             "model": settings.GROQ_MODEL,
@@ -45,9 +45,9 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
         if request.tool_choice is not None:
             kwargs["tool_choice"] = request.tool_choice
 
-        response = client.chat.completions.create(**kwargs)
+        response = await client.chat.completions.create(**kwargs)
 
-        latency_ms = (time.time() - start_time) * 1000
+        latency_ms = (time.perf_counter() - start_time) * 1000
         cost = calculate_cost(
             response.usage.prompt_tokens,
             response.usage.completion_tokens

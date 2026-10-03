@@ -6,6 +6,7 @@ from app.router.router import route, estimate_tokens
 from app.tracker.tracker import tracker
 from app.core.config import get_settings
 from app.core.db import init_pool, close_pool
+from app.cache.cache import close_http
 import groq
 from google import genai
 from app.experiments.schema import ExperimentRun
@@ -23,6 +24,7 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     await init_pool()
     yield
+    await close_http()
     await close_pool()
 
 
@@ -42,8 +44,8 @@ async def health_check():
     gemini_available = True
 
     try:
-        groq_client = groq.Groq(api_key=settings.GROQ_API_KEY)
-        groq_client.models.list()
+        groq_client = groq.AsyncGroq(api_key=settings.GROQ_API_KEY)
+        await groq_client.models.list()
     except Exception:
         groq_available = False
 

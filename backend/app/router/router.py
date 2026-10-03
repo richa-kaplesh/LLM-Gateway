@@ -34,10 +34,11 @@ async def _call_with_retry(client_module, request, attempts=3, delay=2.0):
 
 async def route(request: GatewayRequest) -> GatewayResponse:
     cache = get_cache_for(request)
+    lookup = None
     if cache:
-        cached = cache.get(request)
-        if cached:
-            return cached
+        lookup = await cache.get(request)
+        if lookup.hit:
+            return lookup.hit
 
     estimated_tokens = estimate_tokens(request.messages)
     max_capacity = max(tpm_buckets["groq"].capacity, tpm_buckets["gemini"].capacity)
@@ -91,8 +92,14 @@ async def route(request: GatewayRequest) -> GatewayResponse:
 
     response.was_fallback = was_fallback
 
-    if cache:
-        cache.set(request, response)
+    if cache and lookup and lookup.embedding:
+        emb = lookup.embedding
+        cache.set(request, response, emb)        # store the pure LLM response first
+        # a miss really costs the embedding call on top of the LLM call
+        response.embed_latency_ms = emb.latency_ms
+        response.embed_cost_usd = emb.cost_usd
+        response.latency_ms += emb.latency_ms
+        response.cost_usd += emb.cost_usd
     return response
 
 

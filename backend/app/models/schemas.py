@@ -24,6 +24,8 @@ class GatewayResponse(BaseModel):
     latency_ms: float
     cache_hit: bool
     was_fallback: bool = False
+    embed_latency_ms: float = 0.0   # part of latency_ms spent on the cache's embedding call
+    embed_cost_usd: float = 0.0     # part of cost_usd spent on the cache's embedding call
 
 
 class CostSummary(BaseModel):

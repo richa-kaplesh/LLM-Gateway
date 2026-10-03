@@ -77,18 +77,6 @@ def convert_messages(messages: list[dict]):
 
 
 def convert_tool_choice(tool_choice: str | None):
-    if tool_choice is None:
-        return None
-
-    mode_map = {"auto": "AUTO", "none": "NONE", "required": "ANY"}
-    if tool_choice not in mode_map:
-        raise ValueError(f"Unsupported tool_choice value: {tool_choice!r}")
-
-    mode = mode_map[tool_choice]
-    return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode=mode))
-
-
-def convert_tool_choice(tool_choice: str | None):
     """OpenAI: 'auto' / 'none' / 'required'. Gemini: AUTO / NONE / ANY."""
     if tool_choice is None:
         return None
@@ -138,7 +126,7 @@ def convert_tools(tools: list[dict] | None):
 
 async def complete(request: GatewayRequest) -> GatewayResponse:
     try:
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         contents, system_instruction = convert_messages(request.messages)
         tool = convert_tools(request.tools)
@@ -154,13 +142,13 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
 
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
-        response = client.models.generate_content(
+        response = await client.aio.models.generate_content(
             model=settings.GEMINI_MODEL,
             contents=contents,
             config=config
         )
 
-        latency_ms = (time.time() - start_time) * 1000
+        latency_ms = (time.perf_counter() - start_time) * 1000
 
         cost = calculate_cost(
             response.usage_metadata.prompt_token_count,
