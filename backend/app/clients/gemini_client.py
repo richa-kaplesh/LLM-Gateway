@@ -6,7 +6,8 @@ from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
 from google.genai import errors as genai_errors
 from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError
-
+import logging 
+log = logging.getLogger(__name__)
 settings = get_settings()
 
 client = genai.Client(api_key=settings.GEMINI_API_KEY)
@@ -179,4 +180,5 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
     except genai_errors.ServerError as e:
         raise ProviderUnavailableError(f"Gemini server error: {str(e)}")
     except Exception as e:
+        log.error("Gemini unexpected error", exc_info=True)
         raise ProviderUnavailableError(f"Gemini error: {str(e)}")

@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from collections import OrderedDict
 from app.models.schemas import GatewayRequest, GatewayResponse
 from app.core.config import get_settings
+import logging 
 
+log = logging.getLogger(__name__)
 settings = get_settings()
 
 _EMBED_URL = "https://api.jina.ai/v1/embeddings"
@@ -55,6 +57,8 @@ async def embed(text: str) -> EmbedResult:
     resp = await _http.post(_EMBED_URL, headers=_headers, json=payload)
     latency_ms = (time.perf_counter() - t0) * 1000
     if resp.status_code != 200:
+        log.error("Jina embed API error: status=%s latency_ms=%.0f body=%s",
+                  resp.status_code, latency_ms, resp.text[:200])
         raise RuntimeError(f"Jina embed API error {resp.status_code}: {resp.text[:400]}")
     body = resp.json()
     vector = np.array(body["data"][0]["embedding"], dtype=np.float32)
@@ -77,8 +81,9 @@ class SemanticCache:
         if not query_text:
             return LookupResult(hit=None, embedding=None)
 
-        emb = await embed(query_text)          # always embed once; set() reuses it on a miss
+        emb = await embed(query_text)         
         if not self.queries:
+            log.info("cache miss (cache empty): scope=%s embed_ms=%.0f", request.cache_scope, emb.latency_ms)
             return LookupResult(hit=None, embedding=emb)
 
         t0 = time.perf_counter()
@@ -89,6 +94,9 @@ class SemanticCache:
 
         if max_sim >= settings.CACHE_SIMILARITY_THRESHOLD:
             cached = self.responses[idx]
+            log.info("cache hit: scope=%s similarity=%.3f threshold=%.2f embed_ms=%.0f scan_ms=%.1f cached_provider=%s",
+                     request.cache_scope, max_sim, settings.CACHE_SIMILARITY_THRESHOLD,
+                     emb.latency_ms, lookup_ms, cached.provider_used)
             return LookupResult(
                 hit=GatewayResponse(
                     content=cached.content, tool_calls=cached.tool_calls,
@@ -102,6 +110,8 @@ class SemanticCache:
                 ),
                 embedding=emb, max_similarity=max_sim,
             )
+        log.info("cache miss: scope=%s best_similarity=%.3f threshold=%.2f embed_ms=%.0f",
+                 request.cache_scope, max_sim, settings.CACHE_SIMILARITY_THRESHOLD, emb.latency_ms)
         return LookupResult(hit=None, embedding=emb, max_similarity=max_sim)
 
     def set(self, request: GatewayRequest, response: GatewayResponse, embedding: EmbedResult | None) -> None:

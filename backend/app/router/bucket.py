@@ -1,6 +1,8 @@
 import time
 import random
+import logging
 
+log = logging.getLogger(__name__)
 
 GROQ_WEIGHT = 30
 GEMINI_WEIGHT = 15
@@ -42,21 +44,25 @@ tpm_buckets = {
 
 
 def select_provider(estimated_tokens: int):
-    """Picks a provider by weighted random order, then checks RPM+TPM capacity.
-    Does NOT check the circuit breaker — that happens exactly once, in
-    router.py's _try(), so a request isn't blocked by a probe it itself
-    just triggered (see: double allow_request() bug, found before shipping)."""
+    """(keep your existing docstring)"""
     total = GROQ_WEIGHT + GEMINI_WEIGHT
     roll = random.uniform(0, total)
     first, second = ("groq", "gemini") if roll < GROQ_WEIGHT else ("gemini", "groq")
 
     for p in (first, second):
         if estimated_tokens > tpm_buckets[p].capacity:
+            log.warning("skipping %s: prompt of %d tokens exceeds its TPM capacity of %d",
+                        p, estimated_tokens, tpm_buckets[p].capacity)
             continue
         if rpm_buckets[p].can_consume() and tpm_buckets[p].can_consume(estimated_tokens):
             rpm_buckets[p].consume()
             tpm_buckets[p].consume(estimated_tokens)
+            log.info("provider selected: %s (fresh weighted pick, preferred=%s%s)",
+                     p, first, "" if p == first else ", preferred was out of capacity")
             return p
+        log.warning("token bucket empty: %s (rpm_tokens=%.1f, tpm_tokens=%.0f, needs %d tokens)",
+                    p, rpm_buckets[p].tokens, tpm_buckets[p].tokens, estimated_tokens)
+    log.warning("no provider has capacity (tried %s then %s)", first, second)
     return None
 
 conversation_provider_map: dict[str, str] = {}
@@ -69,10 +75,19 @@ def get_provider_for_conversation(conversation_id: str, estimated_tokens: int):
                 and tpm_buckets[sticky].can_consume(estimated_tokens)):
             rpm_buckets[sticky].consume()
             tpm_buckets[sticky].consume(estimated_tokens)
+            log.info("provider selected: %s (sticky routing, conversation=%s)", sticky, conversation_id)
             return sticky
-        return None   # sticky provider has no room right now
+        log.warning("rate limit: sticky provider %s has no capacity for conversation=%s "
+                    "(rpm_tokens=%.1f, tpm_tokens=%.0f, needs %d tokens); rejecting",
+                    sticky, conversation_id, rpm_buckets[sticky].tokens,
+                    tpm_buckets[sticky].tokens, estimated_tokens)
+        return None
 
     provider = select_provider(estimated_tokens)
     if provider is not None:
         conversation_provider_map[conversation_id] = provider
+        log.info("conversation=%s pinned to %s (no sticky provider yet)", conversation_id, provider)
     return provider
+
+
+

@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from app.models.schemas import GatewayRequest, GatewayResponse, CostSummary, HealthCheck
 from app.router.router import route, estimate_tokens
@@ -14,8 +14,23 @@ from app.experiments.store import load_runs, save_run
 from app.router.circuit_breaker import breakers
 import logging
 from app.clients.exceptions import InvalidRequestError, TooLongError, AllProvidersRateLimitedError
+import time 
+import uuid
+from app.core.logging_setup import setup_logging, request_id_var
 
-log = logging.getLogger("gateway")
+setup_logging()
+
+# uvicorn puts its own plain-text handlers on these loggers, which would break
+# "every line is JSON". Route them through our root handler instead.
+for _name in ("uvicorn", "uvicorn.error"):
+    _lg = logging.getLogger(_name)
+    _lg.handlers.clear()
+    _lg.propagate = True
+logging.getLogger("uvicorn.access").disabled = True   # the middleware below logs every request
+logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs every outbound call at INFO
+
+log = logging.getLogger(__name__)
+http_log = logging.getLogger("gateway.http")
 
 settings = get_settings()
 
@@ -36,6 +51,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    req_id = (request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12])[:64]
+    token = request_id_var.set(req_id)
+    start = time.perf_counter()
+    http_log.info("request started: %s %s", request.method, request.url.path)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = req_id
+        http_log.info("request finished: %s %s -> %d in %.1f ms",
+                      request.method, request.url.path, response.status_code,
+                      (time.perf_counter() - start) * 1000)
+        return response
+    except Exception:
+        http_log.error("request crashed: %s %s after %.1f ms",
+                       request.method, request.url.path,
+                       (time.perf_counter() - start) * 1000, exc_info=True)
+        raise
+    finally:
+        request_id_var.reset(token)
 
 
 @app.get("/health", response_model=HealthCheck)

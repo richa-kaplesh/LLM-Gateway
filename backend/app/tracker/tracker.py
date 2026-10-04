@@ -1,7 +1,7 @@
 from app.models.schemas import GatewayResponse, CostSummary
 from app.core.db import get_pool
-
-
+import logging
+log = logging.getLogger(__name__)
 class CostTracker:
     async def log(self, user_id: str, conversation_id: str, response: GatewayResponse | None,
                    status: str, error_type: str | None = None,
