@@ -4,37 +4,37 @@ import logging
 log = logging.getLogger(__name__)
 
 class CostTracker:
-        async def log(self, user_id: str, conversation_id: str, response: GatewayResponse | None,
+    async def log(self, user_id: str, conversation_id: str, response: GatewayResponse | None,
                    status: str, error_type: str | None = None,
                    cache_scope: str | None = None, estimated_tokens: int | None = None) -> None:
-            pool = get_pool()
+        pool = get_pool()
 
-            # embed_latency_ms defaults to 0.0 when no embedding call happened
-            # (no cache scope, or the request errored). Store NULL in that case,
-            # so averages are not dragged down by fake zeros.
-            embedded = bool(response and response.embed_latency_ms)
-            embed_latency = response.embed_latency_ms if embedded else None
-            embed_cost = response.embed_cost_usd if embedded else None
+        # embed_latency_ms defaults to 0.0 when no embedding call happened
+        # (no cache scope, or the request errored). Store NULL in that case,
+        # so averages are not dragged down by fake zeros.
+        embedded = bool(response and response.embed_latency_ms)
+        embed_latency = response.embed_latency_ms if embedded else None
+        embed_cost = response.embed_cost_usd if embedded else None
 
-            await pool.execute(
-                """INSERT INTO request_logs
-                (user_id, conversation_id, provider_used, model_used, was_fallback,
-                    cost_usd, latency_ms, estimated_tokens, cache_hit, cache_scope,
-                    status, error_type, embed_latency_ms, embed_cost_usd)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
-                user_id, conversation_id,
-                response.provider_used if response else None,
-                response.model_used if response else None,
-                response.was_fallback if response else False,
-                response.cost_usd if response else 0,
-                response.latency_ms if response else None,
-                estimated_tokens,
-                response.cache_hit if response else False,
-                cache_scope,
-                status, error_type,
-                embed_latency, embed_cost,
-            )
-
+        await pool.execute(
+            """INSERT INTO request_logs
+               (user_id, conversation_id, provider_used, model_used, was_fallback,
+                cost_usd, latency_ms, estimated_tokens, cache_hit, cache_scope,
+                status, error_type, embed_latency_ms, embed_cost_usd)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+            user_id, conversation_id,
+            response.provider_used if response else None,
+            response.model_used if response else None,
+            response.was_fallback if response else False,
+            response.cost_usd if response else 0,
+            response.latency_ms if response else None,
+            estimated_tokens,
+            response.cache_hit if response else False,
+            cache_scope,
+            status, error_type,
+            embed_latency, embed_cost,
+        )
+        
     async def log_breaker_transition(self, provider: str, old_state: str, new_state: str) -> None:
         log.warning("circuit breaker %s: %s -> %s", provider, old_state, new_state)
         pool = get_pool()
