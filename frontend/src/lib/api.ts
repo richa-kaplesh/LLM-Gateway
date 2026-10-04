@@ -186,3 +186,149 @@ export async function fetchRequests(): Promise<RequestRecord[]> {
   if (!Array.isArray(data)) return []
   return data as RequestRecord[]
 }
+
+// ── Baseline metrics ───────────────────────────────────────────────────────────
+
+export interface LatencyStats {
+  n: number
+  avg: number | null
+  p50: number | null
+  p95: number | null
+  p99: number | null
+}
+
+export interface ByScope {
+  scope: string
+  requests: number
+  hits: number
+  hit_rate_pct: number | null
+}
+
+export interface ByProvider {
+  provider: string
+  requests: number
+  avg_latency_ms: number | null
+  p95_latency_ms: number | null
+  avg_cost_usd: number | null
+  fallbacks: number
+}
+
+export interface ErrorType {
+  error_type: string
+  count: number
+}
+
+export interface BreakerTransition {
+  provider: string
+  new_state: string
+  count: number
+}
+
+export interface MetricsSummary {
+  window: {
+    since: string | null
+    until: string | null
+    request_count: number
+  }
+  totals: {
+    requests: number
+    errors: number
+    error_rate_pct: number | null
+    fallback_count: number
+    fallback_rate_pct: number | null
+  }
+  error_types: ErrorType[]
+  cache: {
+    hits: number
+    hit_rate_pct: number | null
+    by_scope: ByScope[]
+  }
+  latency_ms: {
+    all: LatencyStats
+    hit: LatencyStats
+    miss: LatencyStats
+  }
+  by_provider: ByProvider[]
+  cost: {
+    total_usd: number | null
+    avg_miss_usd: number | null
+    avg_hit_usd: number | null
+    est_saved_usd: number | null
+  }
+  embed: {
+    rows_with_data: number
+    avg_latency_ms: number | null
+    p95_latency_ms: number | null
+    avg_cost_usd: number | null
+    share_of_miss_latency_pct: number | null
+  }
+  tokens: {
+    avg_estimated: number | null
+    p95_estimated: number | null
+  }
+  legacy: {
+    hit_rows_with_zero_latency: number
+  }
+  breaker: {
+    transitions: BreakerTransition[]
+  }
+}
+
+export interface MetricsSnapshot {
+  id: number
+  label: string
+  taken_at: string
+  window_since: string | null
+  window_until: string | null
+  metrics: MetricsSummary
+}
+
+export async function fetchMetricsSummary(
+  since?: string,
+  until?: string
+): Promise<MetricsSummary> {
+  const params = new URLSearchParams()
+  if (since) params.set('since', since)
+  if (until) params.set('until', until)
+  const qs = params.toString()
+  const res = await fetch(`${API_BASE}/metrics/summary${qs ? `?${qs}` : ''}`)
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText)
+    throw new Error(detail || `Request failed with status ${res.status}`)
+  }
+
+  return res.json() as Promise<MetricsSummary>
+}
+
+export async function fetchMetricsSnapshots(): Promise<MetricsSnapshot[]> {
+  const res = await fetch(`${API_BASE}/metrics/snapshots`)
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText)
+    throw new Error(detail || `Request failed with status ${res.status}`)
+  }
+
+  const data = await res.json()
+  if (!Array.isArray(data)) return []
+  return data as MetricsSnapshot[]
+}
+
+export async function saveMetricsSnapshot(
+  label: string,
+  since?: string,
+  until?: string
+): Promise<MetricsSnapshot> {
+  const res = await fetch(`${API_BASE}/metrics/snapshots`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ label, since, until }),
+  })
+
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText)
+    throw new Error(detail || `Request failed with status ${res.status}`)
+  }
+
+  return res.json() as Promise<MetricsSnapshot>
+}

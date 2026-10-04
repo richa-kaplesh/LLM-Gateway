@@ -4,6 +4,7 @@ import { Layout } from '@/components/Layout'
 import { QueryPage } from '@/pages/QueryPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { ExperimentsPage } from '@/pages/ExperimentsPage'
+import { BaselinePage } from '@/pages/BaselinePage'
 
 export default function App() {
   return (
@@ -26,6 +27,7 @@ export default function App() {
           <Route path="/" element={<QueryPage />} />
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/experiments" element={<ExperimentsPage />} />
+          <Route path="/baseline" element={<BaselinePage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
