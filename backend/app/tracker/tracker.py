@@ -2,6 +2,7 @@ from app.models.schemas import GatewayResponse, CostSummary
 from app.core.db import get_pool
 import logging
 log = logging.getLogger(__name__)
+
 class CostTracker:
     async def log(self, user_id: str, conversation_id: str, response: GatewayResponse | None,
                    status: str, error_type: str | None = None,
@@ -26,6 +27,7 @@ class CostTracker:
         )
 
     async def log_breaker_transition(self, provider: str, old_state: str, new_state: str) -> None:
+        log.warning("circuit breaker %s: %s -> %s", provider, old_state, new_state)
         pool = get_pool()
         await pool.execute(
             "INSERT INTO breaker_events (provider, old_state, new_state) VALUES ($1,$2,$3)",

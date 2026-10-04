@@ -44,7 +44,10 @@ tpm_buckets = {
 
 
 def select_provider(estimated_tokens: int):
-    """(keep your existing docstring)"""
+    """Picks a provider by weighted random order, then checks RPM+TPM capacity.
+    Does NOT check the circuit breaker — that happens exactly once, in
+    router.py's _try(), so a request isn't blocked by a probe it itself
+    just triggered (see: double allow_request() bug, found before shipping)."""
     total = GROQ_WEIGHT + GEMINI_WEIGHT
     roll = random.uniform(0, total)
     first, second = ("groq", "gemini") if roll < GROQ_WEIGHT else ("gemini", "groq")

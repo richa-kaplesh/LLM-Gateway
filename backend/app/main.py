@@ -97,6 +97,9 @@ async def health_check():
 async def handle_query(request: GatewayRequest):
     try:
         response = await route(request)
+        log.info("/query ok: provider=%s model=%s fallback=%s cache_hit=%s latency_ms=%.0f cost_usd=%.6f",
+                 response.provider_used, response.model_used, response.was_fallback,
+                 response.cache_hit, response.latency_ms, response.cost_usd)
         await tracker.log(
             request.user_id, request.conversation_id, response, status="success",
             cache_scope=request.cache_scope,
@@ -105,8 +108,7 @@ async def handle_query(request: GatewayRequest):
         return response
 
     except InvalidRequestError as e:
-        log.info(f"/query rejected (invalid request): {e}")
-
+        log.info("/query rejected (invalid request): %s", e)
         await tracker.log(request.user_id, request.conversation_id, None,
                            status="error", error_type="InvalidRequestError",
                            cache_scope=request.cache_scope,
@@ -114,7 +116,8 @@ async def handle_query(request: GatewayRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     except TooLongError as e:
-        log.info(f"/query rejected (too long): {e}")
+        log.info("/query rejected (too long): %s", e)
+
 
         await tracker.log(request.user_id, request.conversation_id, None,
                            status="error", error_type="TooLongError",
@@ -123,7 +126,8 @@ async def handle_query(request: GatewayRequest):
         raise HTTPException(status_code=413, detail=str(e))
 
     except AllProvidersRateLimitedError as e: 
-        log.warning(f"/query rejected (all providers rate-limited): {e}")
+        log.warning("/query rejected (all providers rate-limited): %s", e)
+
 
         await tracker.log(request.user_id, request.conversation_id, None,
                            status="error", error_type="AllProvidersRateLimitedError",
@@ -132,7 +136,7 @@ async def handle_query(request: GatewayRequest):
         raise HTTPException(status_code=429, detail=str(e))
 
     except Exception as e:
-        log.error(f"/query failed: {e}", exc_info=True)
+        log.error("/query failed: %s", e, exc_info=True)
         await tracker.log(request.user_id, request.conversation_id, None,
                            status="error", error_type=type(e).__name__,
                            cache_scope=request.cache_scope,
