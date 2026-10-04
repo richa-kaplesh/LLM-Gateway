@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     GEMINI_OUTPUT_COST_PER_MILLION: float = 0.30
 
     # Set from Jina's pricing page; 0.0 means embedding cost is NOT being counted
-    JINA_COST_PER_MILLION: float = 0.2
+    JINA_COST_PER_MILLION: float = 0.02
 
     CACHE_SIMILARITY_THRESHOLD: float =  0.90 #0.70 
     CACHE_MAX_SIZE: int = 100
