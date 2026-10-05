@@ -45,17 +45,28 @@ Client (e.g. QueryMind)
 
 - **Fallback with re-pinning, not blind retry.** If the primary provider fails, the gateway tries the other provider and re-pins the conversation to it, so the rest of a multi-step exchange stays consistent. A distinct `InvalidRequestError` (malformed request) skips fallback entirely — no point burning a second API call on a request that will fail everywhere.
 
-- **Semantic caching, explicitly scoped.** Matched via Jina embeddings + cosine similarity, not exact string match — but every request must declare `cache_scope` (`"conversation"`, `"global"`, or none). Defaults to no caching. This exists because of a real bug: an internal RAG-review call used to be cache-eligible by accident, embedding and caching actual document passages in one shared global cache — a semantically similar call from a different user/document could get back someone else's document content (see Engineering log). Tool-calling requests are never cached regardless of scope.
+- **Semantic caching, explicitly scoped.** Matched via Jina embeddings + cosine similarity (threshold 0.90), not exact string match — but every request must declare `cache_scope` (`"conversation"`, `"global"`, or none). Defaults to no caching. This exists because of a real bug: an internal RAG-review call used to be cache-eligible by accident, embedding and caching actual document passages in one shared global cache — a semantically similar call from a different user/document could get back someone else's document content (see Engineering log). The gateway does not currently inspect `tools`, so a tool-calling request that sets a `cache_scope` would be cached; callers should leave `cache_scope` unset for tool calls (see Current limitations).
+
+- **A cache hit is cheap, not free, and the gateway reports its real cost.** Every cacheable request pays one embedding call to Jina, hit or miss. On a hit, `latency_ms` is that embedding call plus the similarity scan, and `cost_usd` is the embedding cost. On a miss, the embedding is paid on top of the LLM call. Both parts are exposed separately as `embed_latency_ms` and `embed_cost_usd`, so the overhead can be measured instead of assumed to be zero. A miss embeds the prompt once and reuses that vector when storing the result.
 
 - **Correct HTTP status codes per failure type**, not a blanket 500. A malformed request, a prompt too long for any provider, and temporary all-providers-rate-limited each return a distinct, semantically correct status (`400`, `413`, `429`), so a caller can tell "never retry this" from "retry this later" without guessing.
 
-- **Durable state where it matters, ephemeral where it doesn't.** Request logs, cost, and circuit-breaker transitions persist in Postgres (Neon) and survive restarts — this replaced an earlier in-memory version that silently lost all history on every Render spin-down. Rate-limit buckets and routing state stay in-memory by design: losing them on restart just means a harmless reset, not lost data.
+- **Durable state where it matters, ephemeral where it doesn't.** Request logs, cost, and circuit-breaker transitions persist in Postgres (Neon) and survive restarts — this replaced an earlier in-memory version that silently lost all history on every Render spin-down. Rate-limit buckets, routing state, and the semantic cache stay in-memory: losing them on restart means a reset (an empty cache, fresh buckets), not lost data.
+
+- **Non-blocking I/O end to end.** Provider calls (Groq, Gemini) and the Jina embedding call all use async clients, so one slow request does not stall every other in-flight request.
+
+## Observability
+
+- **Structured logs:** every log line is one JSON object (timestamp, level, logger, message, request ID).
+- **Request IDs:** each request gets an ID (taken from an incoming `X-Request-ID` header if present, otherwise generated) that appears on every log line for that request and is returned in the `X-Request-ID` response header.
+- **Cache decisions are logged** with the best similarity score, the threshold, the embedding time, and the scan time — on hits and on misses — so a threshold can be judged from real traffic. Prompt text is not logged.
+- **Per-request records in Postgres** include cost, latency, provider, fallback, cache hit/scope, estimated tokens, status, error type, and the embedding latency/cost (stored as NULL when no embedding call happened, so averages are not diluted by fake zeros).
 
 ## Tech stack
 
-**Backend:** FastAPI, Python 3.11, Groq SDK, Google Gen AI SDK (`google-genai`), asyncpg + Postgres (Neon), httpx (Jina embeddings), tiktoken, numpy, Pydantic
-**Frontend:** React, TypeScript, Vite, Tailwind CSS, shadcn/ui
-**Deployment:** Docker, Render
+**Backend:** FastAPI, Python 3.11, Groq SDK (async), Google Gen AI SDK (`google-genai`, async), asyncpg + Postgres (Neon), httpx (async, Jina embeddings), tiktoken, numpy, Pydantic
+**Frontend:** React, TypeScript, Vite, Tailwind CSS, shadcn/ui, Recharts
+**Deployment:** Docker + Render (backend), Vercel (frontend), Neon (Postgres)
 
 ## API
 
@@ -88,19 +99,25 @@ Full interactive schema: `/docs` (Swagger UI).
 
 ### Response shape
 
+Illustrative values for a cache miss with `cache_scope` set:
+
 ```json
 {
   "content": "...",
   "tool_calls": null,
   "finish_reason": "stop",
-  "model_used": "openai/gpt-oss-120b",
+  "model_used": "openai/gpt-oss-20b",
   "provider_used": "groq",
-  "cost_usd": 0.000037,
-  "latency_ms": 771.6,
+  "cost_usd": 0.000107,
+  "latency_ms": 1609.6,
   "cache_hit": false,
-  "was_fallback": false
+  "was_fallback": false,
+  "embed_latency_ms": 879.9,
+  "embed_cost_usd": 0.00000018
 }
 ```
+
+`embed_latency_ms` and `embed_cost_usd` are the part of `latency_ms` / `cost_usd` spent on the cache's embedding call. They are `0.0` when no cache scope was set. On a cache hit, `latency_ms` is approximately `embed_latency_ms` and `cost_usd` equals `embed_cost_usd`.
 
 ### Error responses
 
@@ -129,6 +146,10 @@ GEMINI_API_KEY=...
 JINA_API_KEY=...
 DATABASE_URL=postgresql://...   # Neon connection string
 ```
+
+Optional overrides (defaults live in `app/core/config.py`): `JINA_COST_PER_MILLION` (embedding price used for cost accounting — an estimate, see Current limitations), `CACHE_SIMILARITY_THRESHOLD`, `CACHE_MAX_SIZE`.
+
+The Postgres tables (`request_logs`, `breaker_events`) must exist before the gateway starts logging; the schema is not committed to the repo yet (see Current limitations).
 
 Run:
 ```bash
@@ -164,13 +185,18 @@ Not a changelog of features added — a record of specific defects found by test
 - **Cross-provider tool-call corruption:** removing per-conversation provider stickiness (reasoned to be unnecessary, since full message history is resent every turn) broke multi-step tool-calling conversations — Gemini rejects replaying a function call with no `thought_signature`, which only Gemini itself produces. Stickiness was restored, with the reasoning for *why* documented above instead of just the fix.
 - **Gemini thought-signature drop:** the unified OpenAI-shaped schema had no field for Gemini's `thought_signature`, silently dropping it on every multi-turn tool call and causing a 400 on the second turn. Fixed by capturing and replaying it through the Gemini adapter specifically.
 - **Blanket 500s on every failure type**, making it impossible for a caller to distinguish "never retry" from "retry later" from "actually broken." Replaced with status codes that mean what they say.
-- **Blocking event loop on every request:** both provider clients used their synchronous SDK client with no `await`, freezing the entire gateway — every other in-flight request — for the duration of each call. Found while building streaming support; fixed by switching to each SDK's real async client.
+- **Blocking event loop on every request:** the Groq and Gemini clients used their synchronous SDKs inside `async` functions, and the semantic cache's Jina embedding call used a synchronous HTTP request the same way. Each call froze the entire gateway — every other in-flight request — until it returned. Found while building streaming support; fixed by moving all three to real async clients (`AsyncGroq`, Gemini's `client.aio`, a shared `httpx.AsyncClient`). Measured against a local stub provider with a fixed 1-second delay (so it shows the blocking mechanics, not real provider latency): 5 concurrent calls took 5.05 s with a 5,054 ms event-loop freeze before the fix, and 1.07 s with the loop staying responsive after. The same pass found two cache accounting defects: a cache miss embedded the same prompt twice (once on lookup, once on store), and cache hits were logged with 0 latency and 0 cost even though every hit pays an embedding call. Both fixed; requests logged before this change carry the old zero values for hits. First live measurements after the fix (a handful of requests, not a benchmark): warm cache hits took about 280–380 ms (the embedding call), against about 880 ms for the first, cold call.
 
 ## Current limitations (known, not yet addressed)
 
 - **No real streaming yet.** `stream` exists on the request schema but isn't wired up — the gateway only returns complete responses. Streaming is designed (including reassembling fragmented tool-call arguments, which Groq streams in pieces and Gemini doesn't) but not yet built.
 - **No authentication.** `/query` trusts whatever `user_id` is sent — there's no API key, no verification the caller is who they claim to be, and no per-caller budget. Deliberately deferred, not forgotten.
-- **In-memory routing/rate-limit state doesn't scale horizontally.** Running multiple gateway instances would give each its own separate buckets and breaker state, silently multiplying the real ceiling.
+- **In-memory state doesn't scale horizontally or survive restarts.** Routing, rate-limit buckets, breaker state, and the semantic cache are per-process. Running multiple gateway instances would give each its own separate buckets, breaker state, and cache, silently multiplying the real ceiling. The conversation-to-provider map also has no eviction, so it grows with every new conversation.
+- **The semantic cache's threshold is not yet validated.** The 0.90 cosine threshold has not been measured against labeled data, so the false-hit rate (a look-alike question served another question's answer) and the miss rate on true paraphrases are unknown. In early live tests, a plain paraphrase of a cached prompt scored below the threshold and missed. Per-route thresholds and a labeled evaluation set are the planned next step.
+- **The semantic cache has no quality or safety checks beyond scope.** It stores any completed response, including refusals and short non-answers (one was observed being cached and re-served); it does not skip time-sensitive prompts, has no TTL (only size-based eviction of the oldest entry), scans entries linearly, and does not exclude `tools` requests — the `is_tool_related` field on the request schema is currently unused.
+- **Embedding cost is an estimate.** The Jina price is a configured value (`JINA_COST_PER_MILLION`), not read from the provider. On the free tier the actual bill is zero; the figure shows what the same traffic would cost at list price.
+- **Latency numbers on the free tier are noisy.** Render's free instances spin down when idle, so the first request after a pause includes a cold start that is not the gateway's own latency.
+- **The Postgres schema is not committed.** The tables were created by hand in Neon; there is no `schema.sql` or migration in the repo, so a fresh deployment needs them created manually.
 - **No RBAC, SSO, or audit logging.** Fine for a single-tenant or small-client deployment; a real gap for a multi-tenant enterprise product, named honestly rather than pretended away.
 
 ## Future scope
@@ -182,11 +208,12 @@ Not a changelog of features added — a record of specific defects found by test
 **Features**
 - Real SSE streaming, including tool-call reassembly, with retry/fallback only available before the first token is sent to the client.
 - Additional providers behind the same adapter interface.
-- Cache TTL / explicit invalidation, instead of size-based eviction only.
+- Semantic cache hardening: a labeled paraphrase/look-alike test set to measure false hits and misses, per-route thresholds, an exact-match layer in front of the semantic one, skipping time-sensitive prompts and refusals, and TTL / explicit invalidation instead of size-based eviction only.
 
 **Operations**
 - Per-key API authentication with budget caps.
-- Structured, queryable tracing per request (beyond what `/stats` currently gives).
+- A metrics view with saved snapshots, so measurements before and after each change can be compared over time.
+- Committed database schema / migrations.
 
 **Integration**
 - Full QueryMind integration across both RAG and CSV tool-calling flows.
