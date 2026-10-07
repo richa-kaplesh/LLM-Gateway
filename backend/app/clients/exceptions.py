@@ -1,18 +1,26 @@
 class ProviderUnavailableError(Exception):
-    """Transient problem with THIS specific provider (connection issue, server
-    outage, bad credentials/model name). Safe to retry against the other provider."""
+    """Server-side failure from THIS provider (5xx, auth/config error, bad
+    model name). The provider itself is the problem — do NOT fall back and do
+    NOT rotate keys. Return an error immediately."""
+    pass
+
+
+class ProviderConnectionError(ProviderUnavailableError):
+    """Network-level failure: DNS resolution failed, TCP connection refused,
+    or request timed out before the provider responded.  The provider itself
+    may be perfectly healthy — this is a transient routing/network problem.
+    Safe to fall back to the other provider for this request."""
     pass
 
 
 class ProviderDownError(Exception):
-    """Non-rate-limit failure from a provider: 5xx, connection error, timeout,
-    or auth failure.  The provider is considered DOWN for this request.
-    Do NOT rotate keys or fall back — return this error immediately with a
-    clear message that names the provider and includes the underlying cause.
+    """Unrecoverable failure from a provider: 5xx server error or auth/config
+    problem (bad key, wrong model name).  The provider is broken for this
+    request. Do NOT rotate keys or fall back — return an error immediately
+    that names the provider and includes the underlying cause.
 
-    Distinct from ProviderUnavailableError (which the router uses internally
-    as a fallback signal) so that the multi-key rotation layer can tell the
-    difference between "try the next key" and "stop immediately"."""
+    Connection errors use ProviderConnectionError instead, which allows the
+    router to try the other provider (the network may be fine on that side)."""
     def __init__(self, provider: str, cause: Exception):
         self.provider = provider
         self.cause = cause
@@ -70,11 +78,20 @@ class AllProvidersUnavailableError(Exception):
 # ── Error classifier ──────────────────────────────────────────────────────────
 
 def classify_error(e: Exception) -> str:
-    """Return 'rate_limit' or 'provider_down' for a provider exception.
+    """Classify a provider exception into one of three routing decisions.
 
-    Rule:
-    - HTTP 429 / quota exceeded  → 'rate_limit'   (rotate to next key / provider)
-    - Everything else            → 'provider_down' (stop immediately, no rotation)
+    Returns
+    -------
+    'rate_limit'
+        HTTP 429 / quota exceeded.  Put the key on cooldown and rotate to
+        the next available key / provider.
+    'transient'
+        Network-level failure (DNS, TCP, timeout).  The provider itself may
+        be fine. Try the other provider for this request; do NOT put the key
+        on cooldown.
+    'provider_down'
+        Server-side failure (5xx) or auth/config error (401/403/wrong model).
+        The provider is broken. Stop immediately — no rotation, no fallback.
 
     This is the single authoritative place that encodes the retry policy so
     callers and tests don't have to inspect raw exception types or HTTP codes.
@@ -85,6 +102,10 @@ def classify_error(e: Exception) -> str:
         # The breaker paused a provider after repeated 429s — treat as rate-limit
         # so the caller rotates to another key/provider instead of stopping.
         return "rate_limit"
-    # ProviderUnavailableError, ProviderDownError, connection errors, 5xx, auth
-    # failures, timeouts, and anything else: the provider is considered down.
+    if isinstance(e, ProviderConnectionError):
+        # Network-level failure: the provider may be fine, the network isn't.
+        # Try the other provider; don't penalise this key.
+        return "transient"
+    # ProviderUnavailableError (5xx, bad key, wrong model) and anything else:
+    # the provider itself is the problem — stop immediately.
     return "provider_down"

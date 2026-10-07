@@ -36,8 +36,10 @@ from unittest.mock import patch, MagicMock
 from app.clients.exceptions import (
     ProviderRateLimitedError,
     ProviderUnavailableError,
+    ProviderConnectionError,
     ProviderDownError,
     AllProvidersRateLimitedError,
+    AllProvidersUnavailableError,
     CircuitOpenError,
     classify_error,
 )
@@ -54,8 +56,12 @@ class TestClassifyError:
     def test_circuit_open_is_rate_limit(self):
         assert classify_error(CircuitOpenError("open")) == "rate_limit"
 
+    def test_connection_error_is_transient(self):
+        assert classify_error(ProviderConnectionError("DNS failure")) == "transient"
+
     def test_unavailable_is_provider_down(self):
-        assert classify_error(ProviderUnavailableError("boom")) == "provider_down"
+        # ProviderUnavailableError (5xx, bad key) = provider_down
+        assert classify_error(ProviderUnavailableError("5xx")) == "provider_down"
 
     def test_generic_exception_is_provider_down(self):
         assert classify_error(ConnectionError("timeout")) == "provider_down"
@@ -144,8 +150,14 @@ def _rl(retry_after: float = 30) -> ProviderRateLimitedError:
     return ProviderRateLimitedError("rate limited", retry_after=retry_after)
 
 
-def _down() -> ProviderUnavailableError:
-    return ProviderUnavailableError("server error")
+def _conn() -> ProviderConnectionError:
+    """Simulates Groq APIConnectionError (DNS/TCP failure)."""
+    return ProviderConnectionError("connection refused")
+
+
+def _server_down() -> ProviderUnavailableError:
+    """Simulates a 5xx / auth failure — provider itself is broken."""
+    return ProviderUnavailableError("500 server error")
 
 
 def _make_managers(groq_keys: list[str], gemini_keys: list[str]) -> dict:
@@ -212,16 +224,43 @@ class TestRouteWithKeyRotation:
         assert ("groq", "groq_k2") in calls
 
     @pytest.mark.asyncio
-    async def test_3_provider_down_immediate_stop(self):
-        """groq returns a non-rate-limit error → ProviderDownError raised;
-        gemini is NEVER tried."""
+    async def test_3_connection_error_falls_back_to_other_provider(self):
+        """groq raises a connection error (DNS/TCP) — the router should
+        fall back to Gemini immediately (the network may be fine on that side).
+        This is what was BROKEN before: the old code stopped with a 503 even
+        though Gemini was perfectly reachable."""
         calls = []
 
         async def mock_attempt(provider, request, estimated_tokens, reserve, api_key):
             calls.append(provider)
             if provider == "groq":
-                raise _down()
-            return _make_response("gemini")   # should never be reached
+                raise _conn()     # DNS / TCP failure
+            return _make_response("gemini")   # Gemini works fine
+
+        managers = _make_managers(["groq_k1"], ["gem_k1"])
+
+        with patch.object(_router_module, "_attempt_provider", side_effect=mock_attempt), \
+             patch.object(_router_module, "_key_managers", managers):
+            resp = await _router_module._route_with_key_rotation(
+                "groq", _make_request(), estimated_tokens=100,
+            )
+
+        # Gemini succeeded, groq_k1 was NOT put on cooldown
+        assert resp.provider_used == "gemini"
+        assert calls == ["groq", "gemini"]
+
+    @pytest.mark.asyncio
+    async def test_3b_server_error_stops_immediately(self):
+        """groq returns a 5xx / auth error — that IS a hard stop.
+        Gemini should NOT be tried (the problem is with groq's config/server,
+        not the network)."""
+        calls = []
+
+        async def mock_attempt(provider, request, estimated_tokens, reserve, api_key):
+            calls.append(provider)
+            if provider == "groq":
+                raise _server_down()     # 5xx — hard stop
+            return _make_response("gemini")
 
         managers = _make_managers(["groq_k1"], ["gem_k1"])
 
@@ -233,7 +272,7 @@ class TestRouteWithKeyRotation:
                 )
 
         assert exc_info.value.provider == "groq"
-        assert calls == ["groq"]       # gemini was never tried
+        assert calls == ["groq"]   # gemini was never tried
 
     @pytest.mark.asyncio
     async def test_4_all_keys_exhausted(self):
@@ -278,7 +317,7 @@ class TestRouteWithKeyRotation:
             if provider == "groq" and api_key == "groq_k1":
                 raise _rl()
             if provider == "gemini":
-                raise _down()
+                raise _server_down()
             return _make_response(provider)
 
         managers = _make_managers(["groq_k1", "groq_k2"], ["gem_k1"])

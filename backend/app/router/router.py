@@ -34,7 +34,7 @@ from app.core.config import get_settings
 from app.clients.exceptions import (
     InvalidRequestError, TooLongError, AllProvidersRateLimitedError,
     AllProvidersUnavailableError, ProviderRateLimitedError, CircuitOpenError,
-    ProviderDownError, classify_error,
+    ProviderDownError, ProviderConnectionError, classify_error,
 )
 from app.clients.key_manager import KeyManager
 import asyncio
@@ -227,8 +227,29 @@ async def _route_with_key_rotation(
             km_primary.record_rate_limited(ks, e.retry_after)
             last_rl_primary = e
             log.warning("rotation: %s key %s rate-limited; trying %s", primary, ks.masked, fallback)
+        except ProviderConnectionError as e:
+            # Network-level failure (DNS/TCP/timeout).  Don't penalise the key
+            # (the network may recover); try the other provider immediately.
+            log.warning("rotation: %s connection error; falling back to %s: %s",
+                        primary, fallback, e)
+            ks_fb = km_fallback.next_available()
+            if ks_fb is None:
+                raise AllProvidersUnavailableError(
+                    f"Groq connection error and all {fallback} keys are on cooldown.",
+                    retry_after=km_fallback.soonest_retry_seconds(),
+                ) from e
+            try:
+                resp = await _attempt_provider(fallback, request, estimated_tokens,
+                                               reserve=True, api_key=ks_fb.key)
+                km_fallback.record_success(ks_fb)
+                return resp
+            except Exception as fb_err:
+                raise AllProvidersUnavailableError(
+                    f"{primary} connection error AND {fallback} failed: {fb_err}",
+                    retry_after=None,
+                ) from fb_err
         except Exception as e:
-            # Non-rate-limit failure → provider is down; stop immediately
+            # Server-side failure (5xx, bad key, wrong model) — stop immediately
             raise ProviderDownError(primary, e) from e
 
     # Alternating loop: fallback → primary → fallback → …
@@ -265,8 +286,12 @@ async def _route_with_key_rotation(
             else:
                 last_rl_primary = e
             log.warning("rotation: %s key %s rate-limited; switching to other side", turn, ks.masked)
+        except ProviderConnectionError as e:
+            # Connection error in the alternating loop — log and keep rotating
+            # (other keys/providers may work; don't stop here).
+            log.warning("rotation: %s connection error; continuing rotation: %s", turn, e)
         except Exception as e:
-            # Non-rate-limit failure → provider is down; stop immediately
+            # Server-side failure — stop immediately
             raise ProviderDownError(turn, e) from e
 
         turn = _other_provider(turn)

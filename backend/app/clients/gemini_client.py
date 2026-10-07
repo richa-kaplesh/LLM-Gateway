@@ -6,7 +6,7 @@ from google.genai import types
 from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
 from google.genai import errors as genai_errors
-from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError, ProviderRateLimitedError
+from app.clients.exceptions import ProviderUnavailableError, ProviderConnectionError, InvalidRequestError, ProviderRateLimitedError
 import logging
 log = logging.getLogger(__name__)
 settings = get_settings()
@@ -204,12 +204,17 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
             retry_after = _retry_after_seconds(e)
             log.warning("Gemini 429 (retry_after=%s): %s", retry_after, str(e)[:300])
             raise ProviderRateLimitedError(f"Gemini quota exceeded: {str(e)[:300]}", retry_after=retry_after)
-        if code in (401, 403, 404, 408):
-            # bad key, no access to this model, wrong GEMINI_MODEL, or timeout:
-            # a provider-side/config problem, NOT a malformed request, so fail over
+        if code in (401, 403, 404):
+            # Bad key, no access to this model, or wrong GEMINI_MODEL: a
+            # provider-side config problem. Do NOT fall back — the same bad
+            # key/model would fail on retry too.
             log.error("Gemini HTTP %s: check GEMINI_API_KEY and GEMINI_MODEL=%s: %s",
                       code, settings.GEMINI_MODEL, str(e)[:300])
             raise ProviderUnavailableError(f"Gemini unavailable (HTTP {code}): {str(e)[:300]}")
+        if code == 408:
+            # Timeout: the network timed out, not a server problem. The other
+            # provider may respond fine — treat as a transient connection error.
+            raise ProviderConnectionError(f"Gemini request timed out (HTTP 408): {str(e)[:300]}")
         raise InvalidRequestError(f"Gemini rejected the request: {str(e)}")
     except genai_errors.ServerError as e:
         raise ProviderUnavailableError(f"Gemini server error: {str(e)}")

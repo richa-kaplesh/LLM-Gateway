@@ -2,7 +2,7 @@ import time
 import groq
 from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
-from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError, ProviderRateLimitedError
+from app.clients.exceptions import ProviderUnavailableError, ProviderConnectionError, InvalidRequestError, ProviderRateLimitedError
 import logging
 log = logging.getLogger(__name__)
 
@@ -100,8 +100,10 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
         retry_after = _retry_after_seconds(e)
         log.warning("Groq 429 (retry_after=%s): %s", retry_after, detail)
         raise ProviderRateLimitedError(f"Groq rate limit hit: {detail}", retry_after=retry_after)
-    except groq.APIConnectionError:
-        raise ProviderUnavailableError("Groq connection failed")
+    except groq.APIConnectionError as e:
+        # Network-level failure (DNS, TCP, timeout) — the provider may be fine.
+        # ProviderConnectionError tells the router to try the other provider.
+        raise ProviderConnectionError(f"Groq connection failed: {e}")
     except groq.BadRequestError as e:
         code = (getattr(e, "body", None) or {}).get("error", {}).get("code")
         if code == "tool_use_failed":
