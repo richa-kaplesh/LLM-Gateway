@@ -1,6 +1,7 @@
 import json
 import re
 import time
+import asyncio
 from google import genai
 from google.genai import types
 from app.core.config import get_settings
@@ -10,6 +11,46 @@ from app.clients.exceptions import ProviderUnavailableError, ProviderConnectionE
 import logging
 log = logging.getLogger(__name__)
 settings = get_settings()
+
+# ── Network / timeout error detector ──────────────────────────────────────
+# httpcore.ReadTimeout (and similar) bubble up through the Google SDK as a
+# plain Exception — we detect them by name so we don't have to import httpcore.
+_NETWORK_ERROR_KEYWORDS = (
+    "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
+    "TimeoutException",   # httpcore base
+    "ConnectError", "RemoteProtocolError",
+    "ReadError", "WriteError",
+)
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """Return True if exc (or any exception in its cause chain) looks like a
+    network-level timeout or connection failure from httpcore / httpx.
+
+    We walk __cause__ and __context__ so exceptions wrapped by the SDK's
+    tenacity retry layer are also caught.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        name = type(current).__name__
+        module = getattr(type(current), "__module__", "") or ""
+        if name in _NETWORK_ERROR_KEYWORDS:
+            return True
+        # Also catch asyncio.TimeoutError and built-in TimeoutError
+        if isinstance(current, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+            return True
+        # Any exception from the httpcore / httpx namespace with "Timeout" in name
+        if ("httpcore" in module or "httpx" in module) and (
+            "Timeout" in name or "Connection" in name or "Read" in name
+        ):
+            return True
+        next_exc = getattr(current, "__cause__", None)
+        if next_exc is None:
+            next_exc = getattr(current, "__context__", None)
+        current = next_exc
+    return False
 
 
 def _make_client(api_key: str) -> genai.Client:
@@ -219,5 +260,14 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
     except genai_errors.ServerError as e:
         raise ProviderUnavailableError(f"Gemini server error: {str(e)}")
     except Exception as e:
+        # httpcore.ReadTimeout and other network/connection errors bubble up
+        # here as plain Exceptions (the SDK wraps them without re-typing).
+        # Detect by walking the cause chain — if it's a network issue, raise
+        # ProviderConnectionError so the router falls back to Groq instead of
+        # stopping with a 503.
+        if _is_network_error(e):
+            log.warning("Gemini network/timeout error (will try Groq fallback): %s: %s",
+                        type(e).__name__, e)
+            raise ProviderConnectionError(f"Gemini network error: {e}") from e
         log.error("Gemini unexpected error", exc_info=True)
         raise ProviderUnavailableError(f"Gemini error: {str(e)}")
