@@ -84,13 +84,13 @@ async def health_check():
     gemini_available = True
 
     try:
-        groq_client = groq.AsyncGroq(api_key=settings.GROQ_API_KEY)
+        groq_client = groq.AsyncGroq(api_key=settings.groq_keys()[0])
         await groq_client.models.list()
     except Exception:
         groq_available = False
 
     try:
-        genai.Client(api_key=settings.GEMINI_API_KEY)
+        genai.Client(api_key=settings.gemini_keys()[0])
     except Exception:
         gemini_available = False
 
@@ -189,4 +189,11 @@ async def log_experiment(run: ExperimentRun):
 
 @app.get("/breakers")
 async def breaker_status():
-    return {name: b.snapshot() for name, b in breakers.items()}
+    from app.router.router import _key_managers
+    result = {}
+    for name, b in breakers.items():
+        result[name] = {
+            **b.snapshot(),
+            "keys": _key_managers[name].status_summary(),
+        }
+    return result

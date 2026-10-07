@@ -135,14 +135,22 @@ Illustrative values for a cache miss with `cache_scope` set:
 ```bash
 cd backend
 python -m venv venv
-venv\Scripts\activate        # Windows
+venv\\Scripts\\activate        # Windows
 pip install -r requirements.txt
 ```
 
-Create `backend/.env`:
+Create `backend/.env` (copy from `backend/.env.example`):
+
 ```
-GROQ_API_KEY=...
-GEMINI_API_KEY=...
+# Recommended: multiple keys, comma-separated (spaces around commas are fine;
+# trailing comma is harmless; do NOT use quotes)
+GROQ_API_KEYS=gsk_key1,gsk_key2,gsk_key3
+GEMINI_API_KEYS=AIzaSy_key1,AIzaSy_key2
+
+# Legacy single-key fallback (ignored when *_API_KEYS is set)
+# GROQ_API_KEY=gsk_...
+# GEMINI_API_KEY=AIzaSy_...
+
 JINA_API_KEY=...
 DATABASE_URL=postgresql://...   # Neon connection string
 ```
@@ -155,6 +163,48 @@ Run:
 ```bash
 uvicorn app.main:app --reload
 ```
+
+### Multi-key configuration
+
+The gateway supports multiple API keys per provider so that a 429 on one key
+does not stall the entire gateway.
+
+#### .env format (copy-paste ready)
+
+```
+# One line, comma-separated.  Spaces around commas are stripped.
+# Trailing commas and empty entries are ignored.
+# Do NOT wrap in quotes.
+GROQ_API_KEYS=gsk_key1,gsk_key2,gsk_key3
+GEMINI_API_KEYS=AIzaSy_key1,AIzaSy_key2
+```
+
+**If you only have one key** per provider, set the single-key var instead — either works:
+
+```
+GROQ_API_KEY=gsk_your_single_key
+GEMINI_API_KEY=AIzaSy_your_single_key
+```
+
+#### Rotation rules
+
+| Situation | What happens |
+|---|---|
+| Provider returns HTTP 429 | That key goes on cooldown (Retry-After respected). The OTHER provider is tried first, then keys alternate across both providers. |
+| Every key on every provider is rate-limited | `429` returned to caller with the soonest `Retry-After`. |
+| Provider returns 5xx / connection error / auth failure | **Stop immediately. No rotation.** Returns a clear error naming the provider and cause. |
+| Request is malformed (`InvalidRequestError`) | **Stop immediately.** Retrying elsewhere can't help. |
+
+#### Where to set these vars
+
+| Deployment | How |
+|---|---|
+| **Local dev** | `backend/.env` (already covered) |
+| **Docker / docker-compose** | `env_file: ./backend/.env` is already wired in `docker-compose.yml` |
+| **Render** | Dashboard → your service → *Environment* tab → add `GROQ_API_KEYS` and `GEMINI_API_KEYS` as plain-text env vars (one value, comma-separated, no quotes) |
+| **Vercel** | The frontend doesn't call providers directly; only the backend URL (`VITE_API_URL`) is needed in Vercel |
+
+> **Security**: Never commit real keys to any file tracked by git. `backend/.env` is in `.gitignore`. Only `backend/.env.example` (containing placeholders) is committed.
 
 ### Frontend
 

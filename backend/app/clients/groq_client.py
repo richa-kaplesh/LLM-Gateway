@@ -8,14 +8,16 @@ log = logging.getLogger(__name__)
 
 settings = get_settings()
 
-# max_retries=0: the gateway owns retry/fallback policy. The SDK's built-in retries
-# (default 2, including on 429) would silently multiply every upstream call and
-# burn the very quota we are trying to protect.
-client = groq.AsyncGroq(
-    api_key=settings.GROQ_API_KEY,
-    max_retries=0,
-    timeout=settings.PROVIDER_TIMEOUT_SECONDS,
-)
+
+def _make_client(api_key: str) -> groq.AsyncGroq:
+    # max_retries=0: the gateway owns retry/fallback policy. The SDK's built-in
+    # retries (default 2, including on 429) would silently multiply every
+    # upstream call and burn the very quota we are trying to protect.
+    return groq.AsyncGroq(
+        api_key=api_key,
+        max_retries=0,
+        timeout=settings.PROVIDER_TIMEOUT_SECONDS,
+    )
 
 
 def _retry_after_seconds(e: Exception) -> float | None:
@@ -50,7 +52,11 @@ def normalize_tool_calls(tool_calls):
     ]
 
 
-async def complete(request: GatewayRequest) -> GatewayResponse:
+async def complete(request: GatewayRequest, api_key: str | None = None) -> GatewayResponse:
+    """Call Groq.  Pass ``api_key`` to use a specific key; omit to fall back to
+    the single legacy key in settings (backward-compatible behaviour)."""
+    key = api_key or settings.GROQ_API_KEY
+    client = _make_client(key)
     try:
         start_time = time.perf_counter()
 

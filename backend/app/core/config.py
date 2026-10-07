@@ -1,10 +1,34 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+import os
+
+
+def _parse_key_list(env_value: str) -> list[str]:
+    """Parse a comma-separated list of API keys.
+    Strips whitespace around each entry and drops empty entries, so small
+    formatting mistakes in .env (trailing comma, stray space) don't break things.
+    """
+    return [k.strip() for k in env_value.split(",") if k.strip()]
 
 
 class Settings(BaseSettings):
-    GROQ_API_KEY: str
-    GEMINI_API_KEY: str
+    # ── Single-key vars (kept for backward compatibility) ──────────────────
+    # These are read when the multi-key list vars are absent.  If you set
+    # GROQ_API_KEYS / GEMINI_API_KEYS they take precedence; GROQ_API_KEY /
+    # GEMINI_API_KEY are then ignored.  Either way, at least one key per
+    # provider must be present at startup.
+    GROQ_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+
+    # ── Multi-key vars (new) ───────────────────────────────────────────────
+    # Comma-separated list, e.g.:
+    #   GROQ_API_KEYS=gsk_key1,gsk_key2,gsk_key3
+    #   GEMINI_API_KEYS=AIza_key1,AIza_key2
+    # Leading/trailing spaces around commas are stripped.  Empty entries are
+    # ignored so a trailing comma is harmless.
+    GROQ_API_KEYS: str = ""
+    GEMINI_API_KEYS: str = ""
+
     JINA_API_KEY: str
 
     GROQ_MODEL: str = "openai/gpt-oss-20b"
@@ -43,6 +67,43 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         extra = "ignore"
+
+    # ── Resolved key lists (computed from env, not fields) ─────────────────
+    def groq_keys(self) -> list[str]:
+        """Return the list of Groq API keys to use.
+
+        Priority:
+        1. GROQ_API_KEYS  (comma-separated, new multi-key var)
+        2. GROQ_API_KEY   (legacy single-key var)
+        Raises ValueError at startup if no key is configured at all.
+        """
+        if self.GROQ_API_KEYS:
+            keys = _parse_key_list(self.GROQ_API_KEYS)
+            if keys:
+                return keys
+        if self.GROQ_API_KEY:
+            return [self.GROQ_API_KEY]
+        raise ValueError(
+            "No Groq API key found. Set GROQ_API_KEYS (comma-separated) or GROQ_API_KEY."
+        )
+
+    def gemini_keys(self) -> list[str]:
+        """Return the list of Gemini API keys to use.
+
+        Priority:
+        1. GEMINI_API_KEYS  (comma-separated, new multi-key var)
+        2. GEMINI_API_KEY   (legacy single-key var)
+        Raises ValueError at startup if no key is configured at all.
+        """
+        if self.GEMINI_API_KEYS:
+            keys = _parse_key_list(self.GEMINI_API_KEYS)
+            if keys:
+                return keys
+        if self.GEMINI_API_KEY:
+            return [self.GEMINI_API_KEY]
+        raise ValueError(
+            "No Gemini API key found. Set GEMINI_API_KEYS (comma-separated) or GEMINI_API_KEY."
+        )
 
 
 @lru_cache()

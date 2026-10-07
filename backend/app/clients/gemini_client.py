@@ -11,11 +11,13 @@ import logging
 log = logging.getLogger(__name__)
 settings = get_settings()
 
-# timeout is in milliseconds; without one a hung connection hangs the request
-client = genai.Client(
-    api_key=settings.GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=int(settings.PROVIDER_TIMEOUT_SECONDS * 1000)),
-)
+
+def _make_client(api_key: str) -> genai.Client:
+    # timeout is in milliseconds; without one a hung connection hangs the request
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=int(settings.PROVIDER_TIMEOUT_SECONDS * 1000)),
+    )
 
 
 def _retry_after_seconds(e: Exception) -> float | None:
@@ -145,7 +147,11 @@ def convert_tools(tools: list[dict] | None):
 
 
 
-async def complete(request: GatewayRequest) -> GatewayResponse:
+async def complete(request: GatewayRequest, api_key: str | None = None) -> GatewayResponse:
+    """Call Gemini.  Pass ``api_key`` to use a specific key; omit to fall back
+    to the single legacy key in settings (backward-compatible behaviour)."""
+    key = api_key or settings.GEMINI_API_KEY
+    client = _make_client(key)
     try:
         start_time = time.perf_counter()
 
