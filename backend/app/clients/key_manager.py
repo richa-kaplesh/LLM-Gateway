@@ -72,7 +72,7 @@ class KeyManager:
     """
 
     DEFAULT_COOLDOWN_SECONDS = 60.0   # used when Retry-After is absent
-
+    MAX_COOLDOWN_SECONDS = 600.0
     def __init__(self, provider: str, keys: list[str]):
         if not keys:
             raise ValueError(f"KeyManager for {provider!r} received an empty key list")
@@ -105,6 +105,8 @@ class KeyManager:
 
     def record_rate_limited(self, ks: KeyState, retry_after: float | None) -> None:
         cooldown = retry_after if retry_after is not None else self.DEFAULT_COOLDOWN_SECONDS
+        cooldown = min(max(cooldown, 1.0), self.MAX_COOLDOWN_SECONDS)
+
         ks.put_on_cooldown(cooldown)
         log.warning(
             "key %s on provider %s: rate-limited, cooldown=%.0f s (retry_after=%s)",

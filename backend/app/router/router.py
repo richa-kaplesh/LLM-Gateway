@@ -12,10 +12,13 @@ Rotation rules
       on — alternating until all keys on both providers are exhausted.
    d. If every key on every provider is rate-limited: return
       AllProvidersRateLimitedError with the soonest retry time.
-4. If a provider returns a NON-rate-limit failure (5xx, connection error,
-   timeout, auth failure): classify_error() returns 'provider_down'.
-   Stop immediately — no key rotation, no fallback.  Return a clear error
+4. If a provider's circuit breaker is open, skip that provider (all its keys)
+   and use the other one. An open breaker is not "provider down"; it means
+   "this one is resting".
+5. If a provider returns a server-side failure (5xx, auth failure, wrong model):
+   stop immediately — no key rotation, no fallback.  Return a clear error
    that names the provider and includes the underlying cause.
+   (Connection errors/timeouts are different: they fall back to the other provider.)
 
 The classify_error() helper in exceptions.py is the single place that encodes
 the "rotate vs stop" decision, making it easy to read and test independently.
@@ -94,8 +97,8 @@ async def _call_with_retry(client_module, request, api_key: str, attempts=3, del
         t0 = time.perf_counter()
         try:
             return await client_module.complete(request, api_key=api_key)
-        except (InvalidRequestError, ProviderRateLimitedError):
-            raise          # retrying the same provider can't help
+        except (InvalidRequestError, ProviderRateLimitedError, ProviderConnectionError):
+            raise          # retrying the same provider can't help (a timeout would cost 60s per retry)
         except Exception as e:
             last_error = e
             log.warning("%s call failed after %.0f ms (attempt %d/%d): %s",
@@ -119,10 +122,6 @@ async def _attempt_provider(p: str, request: GatewayRequest, estimated_tokens: i
     state_before = breaker.state
     if not breaker.allow_request():
         release_capacity(p, estimated_tokens)         # nothing was sent, give it back
-        paused = breaker.pause_remaining()
-        if paused > 0:
-            log.warning("%s is cooling down after a rate limit (%.0fs left), skipping it", p, paused)
-            raise ProviderRateLimitedError(f"{p} is cooling down after a rate limit", retry_after=paused)
         log.warning("circuit %s for %s, skipping it", breaker.state, p)
         raise CircuitOpenError(f"{p} circuit is {breaker.state}, skipping", retry_after=breaker.retry_after())
 
@@ -143,9 +142,11 @@ async def _attempt_provider(p: str, request: GatewayRequest, estimated_tokens: i
         log.info("provider %s rejected the request as invalid: %s", p, e)
         raise
     except ProviderRateLimitedError as e:
-        breaker.record_rate_limited(e.retry_after)    # alive but busy: pause, don't count a failure
+        # alive but busy: not a failure, and NOT a provider-wide pause. The router puts
+        # only THIS key on cooldown so the provider's other keys can still be tried.
+        breaker.record_reachable()
         release_capacity(p, estimated_tokens)
-        log.warning("provider %s rate-limited us (pausing %.0fs): %s", p, breaker.pause_remaining(), e)
+        log.warning("provider %s answered 429 (retry_after=%s): %s", p, e.retry_after, e)
         raise
     except asyncio.CancelledError:
         breaker.record_inconclusive()                 # a cancelled probe must not wedge half_open
@@ -153,6 +154,8 @@ async def _attempt_provider(p: str, request: GatewayRequest, estimated_tokens: i
         raise
     except Exception as e:
         breaker.record_failure()
+        if isinstance(e, ProviderConnectionError):
+            release_capacity(p, estimated_tokens)     # request most likely never completed
         log.warning("provider %s failed (breaker=%s, consecutive_failures=%d): %s",
                     p, breaker.state, breaker.consecutive_failures, e)
         raise
@@ -202,16 +205,17 @@ async def _route_with_key_rotation(
     # Track the last rate-limit error from each provider for building the final error
     last_rl_primary: ProviderRateLimitedError | None = None
     last_rl_fallback: ProviderRateLimitedError | None = None
+    # Providers whose circuit breaker is open: every key on them is skipped.
+    # An open breaker is NOT "provider down": it means "skip this one, use the other".
+    circuit_open: dict[str, CircuitOpenError] = {}
 
-    # Build an interleaved sequence: primary, fallback, primary, fallback, …
-    # We keep drawing one key from each provider alternately until both are dry.
-    # We track the last key tried on each side so we can skip it in next_available().
     tried_primary_key: str | None = None
     tried_fallback_key: str | None = None
 
     # First attempt: primary provider (capacity already reserved in route())
     ks = km_primary.next_available()
     if ks is None:
+        release_capacity(primary, estimated_tokens)   # reserved in route() but never used
         log.warning("all %s keys are on cooldown at start", primary)
     else:
         tried_primary_key = ks.key
@@ -227,27 +231,13 @@ async def _route_with_key_rotation(
             km_primary.record_rate_limited(ks, e.retry_after)
             last_rl_primary = e
             log.warning("rotation: %s key %s rate-limited; trying %s", primary, ks.masked, fallback)
+        except CircuitOpenError as e:
+            circuit_open[primary] = e
+            log.warning("rotation: %s circuit is %s; skipping it, trying %s", primary, "open", fallback)
         except ProviderConnectionError as e:
-            # Network-level failure (DNS/TCP/timeout).  Don't penalise the key
-            # (the network may recover); try the other provider immediately.
-            log.warning("rotation: %s connection error; falling back to %s: %s",
-                        primary, fallback, e)
-            ks_fb = km_fallback.next_available()
-            if ks_fb is None:
-                raise AllProvidersUnavailableError(
-                    f"Groq connection error and all {fallback} keys are on cooldown.",
-                    retry_after=km_fallback.soonest_retry_seconds(),
-                ) from e
-            try:
-                resp = await _attempt_provider(fallback, request, estimated_tokens,
-                                               reserve=True, api_key=ks_fb.key)
-                km_fallback.record_success(ks_fb)
-                return resp
-            except Exception as fb_err:
-                raise AllProvidersUnavailableError(
-                    f"{primary} connection error AND {fallback} failed: {fb_err}",
-                    retry_after=None,
-                ) from fb_err
+            # Network-level failure (DNS/TCP/timeout). Don't penalise the key
+            # (the network may recover); go try the other provider.
+            log.warning("rotation: %s connection error; falling back to %s: %s", primary, fallback, e)
         except Exception as e:
             # Server-side failure (5xx, bad key, wrong model) — stop immediately
             raise ProviderDownError(primary, e) from e
@@ -255,7 +245,13 @@ async def _route_with_key_rotation(
     # Alternating loop: fallback → primary → fallback → …
     # Each iteration picks one key from whichever side is "next".
     turn = fallback      # who we are about to try
-    for _ in range(km_primary.key_count() + km_fallback.key_count()):
+    for _ in range(2 * (km_primary.key_count() + km_fallback.key_count()) + 2):
+        if len(circuit_open) == 2:
+            break
+        if turn in circuit_open:
+            turn = _other_provider(turn)
+            continue
+
         km = km_fallback if turn == fallback else km_primary
         skip = tried_fallback_key if turn == fallback else tried_primary_key
 
@@ -263,6 +259,8 @@ async def _route_with_key_rotation(
         if ks is None:
             log.info("no available keys left on %s, switching side", turn)
             turn = _other_provider(turn)
+            if _all_sides_dry(km_primary, km_fallback, circuit_open):
+                break
             continue
 
         if turn == fallback:
@@ -272,9 +270,10 @@ async def _route_with_key_rotation(
 
         log.info("rotation: trying provider=%s key=%s", turn, ks.masked)
         try:
+            # reserve=True on both sides: the first attempt's reservation was already
+            # released (429 / open circuit / connection error), so re-reserve each time.
             resp = await _attempt_provider(turn, request, estimated_tokens,
-                                           reserve=(turn == fallback),
-                                           api_key=ks.key)
+                                           reserve=True, api_key=ks.key)
             km.record_success(ks)
             return resp
         except InvalidRequestError:
@@ -286,6 +285,9 @@ async def _route_with_key_rotation(
             else:
                 last_rl_primary = e
             log.warning("rotation: %s key %s rate-limited; switching to other side", turn, ks.masked)
+        except CircuitOpenError as e:
+            circuit_open[turn] = e
+            log.warning("rotation: %s circuit is open; skipping the provider", turn)
         except ProviderConnectionError as e:
             # Connection error in the alternating loop — log and keep rotating
             # (other keys/providers may work; don't stop here).
@@ -296,22 +298,38 @@ async def _route_with_key_rotation(
 
         turn = _other_provider(turn)
 
-    # All keys on all providers exhausted
-    soonest = min(
-        (t for t in (km_primary.soonest_retry_seconds(), km_fallback.soonest_retry_seconds())
-         if t is not None),
-        default=None,
-    )
+    # Nothing could serve the request.
+    if circuit_open and last_rl_primary is None and last_rl_fallback is None:
+        hints = [e.retry_after for e in circuit_open.values() if e.retry_after is not None]
+        log.error("no provider available: %s", "; ".join(str(e) for e in circuit_open.values()))
+        raise AllProvidersUnavailableError(
+            "No provider available: " + "; ".join(str(e) for e in circuit_open.values()),
+            retry_after=min(hints) if hints else None,
+        )
+
+    candidates = [km.soonest_retry_seconds()
+                  for name, km in ((primary, km_primary), (fallback, km_fallback))
+                  if name not in circuit_open]
+    candidates += [e.retry_after for e in circuit_open.values()]
+    soonest = min((t for t in candidates if t is not None), default=None)
     errors = " | ".join(filter(None, [str(last_rl_primary), str(last_rl_fallback)]))
     log.error(
         "all keys exhausted on both providers (groq=%d keys, gemini=%d keys); "
         "soonest retry in %.0f s",
-        km_primary.key_count(), km_fallback.key_count(), soonest or 0,
+        _key_managers["groq"].key_count(), _key_managers["gemini"].key_count(), soonest or 0,
     )
     raise AllProvidersRateLimitedError(
         f"All keys on every provider are rate-limited. {errors}",
         retry_after=soonest,
     )
+
+
+def _all_sides_dry(km_primary: KeyManager, km_fallback: KeyManager, circuit_open: dict) -> bool:
+    """True when no side has a usable key left (cooled down, or its breaker is open)."""
+    for name, km in ((km_primary.provider, km_primary), (km_fallback.provider, km_fallback)):
+        if name not in circuit_open and not km.all_on_cooldown():
+            return False
+    return True
 
 
 async def route(request: GatewayRequest) -> GatewayResponse:

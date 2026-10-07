@@ -90,6 +90,15 @@ class CircuitBreaker:
             self.consecutive_failures = 0
             self.probe_started_at = None
 
+    def record_reachable(self):
+        """Provider answered (e.g. with a 429), so it is up. If we were probing,
+        close the breaker. Rate limits are handled per key by KeyManager, NOT by
+        pausing the whole provider (that would block the provider's other keys)."""
+        if self.state == "half_open":
+            self.state = "closed"
+            self.consecutive_failures = 0
+            self.probe_started_at = None
+
     def record_inconclusive(self):
         """Probe ended for reasons unrelated to provider health (invalid request,
         cancelled). Go back to open and restart the cooldown."""
