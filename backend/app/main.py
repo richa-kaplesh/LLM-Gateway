@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from app.models.schemas import GatewayRequest, GatewayResponse, CostSummary, HealthCheck
-from app.router.router import route, estimate_tokens
+from app.router.router import route, estimate_request_tokens
 from app.tracker.tracker import tracker
 from app.core.config import get_settings
 from app.core.db import init_pool, close_pool
@@ -13,8 +13,12 @@ from app.experiments.schema import ExperimentRun
 from app.experiments.store import load_runs, save_run
 from app.router.circuit_breaker import breakers
 import logging
-from app.clients.exceptions import InvalidRequestError, TooLongError, AllProvidersRateLimitedError
-import time 
+from app.clients.exceptions import (
+    InvalidRequestError, TooLongError, AllProvidersRateLimitedError, AllProvidersUnavailableError,
+)
+import asyncio
+import math
+import time
 import uuid
 from app.core.logging_setup import setup_logging, request_id_var
 
@@ -93,55 +97,67 @@ async def health_check():
     return HealthCheck(status="ok", groq_available=groq_available, gemini_available=gemini_available)
 
 
+DB_TIMEOUT_SECONDS = 2.0
+
+
+async def _track(request: GatewayRequest, response, status: str, error_type: str | None = None) -> None:
+    """Best-effort request logging. A database problem (Neon suspended, connection
+    reset) must never turn a good answer into a 500, or hang the response."""
+    try:
+        await asyncio.wait_for(
+            tracker.log(
+                request.user_id, request.conversation_id, response, status=status,
+                error_type=error_type, cache_scope=request.cache_scope,
+                estimated_tokens=estimate_request_tokens(request),
+            ),
+            DB_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        log.warning("could not persist request log: %s: %s", type(e).__name__, e)
+
+
+def _retry_headers(retry_after: float | None) -> dict | None:
+    if retry_after is None:
+        return None
+    return {"Retry-After": str(max(1, math.ceil(retry_after)))}
+
+
 @app.post("/query", response_model=GatewayResponse)
 async def handle_query(request: GatewayRequest):
     try:
         response = await route(request)
-        log.info("/query ok: provider=%s model=%s fallback=%s cache_hit=%s latency_ms=%.0f cost_usd=%.6f",
-                 response.provider_used, response.model_used, response.was_fallback,
-                 response.cache_hit, response.latency_ms, response.cost_usd)
-        await tracker.log(
-            request.user_id, request.conversation_id, response, status="success",
-            cache_scope=request.cache_scope,
-            estimated_tokens=estimate_tokens(request.messages),
-        )
-        return response
-
     except InvalidRequestError as e:
         log.info("/query rejected (invalid request): %s", e)
-        await tracker.log(request.user_id, request.conversation_id, None,
-                           status="error", error_type="InvalidRequestError",
-                           cache_scope=request.cache_scope,
-                           estimated_tokens=estimate_tokens(request.messages))
+        await _track(request, None, "error", "InvalidRequestError")
         raise HTTPException(status_code=400, detail=str(e))
 
     except TooLongError as e:
         log.info("/query rejected (too long): %s", e)
-
-
-        await tracker.log(request.user_id, request.conversation_id, None,
-                           status="error", error_type="TooLongError",
-                           cache_scope=request.cache_scope,
-                           estimated_tokens=estimate_tokens(request.messages))
+        await _track(request, None, "error", "TooLongError")
         raise HTTPException(status_code=413, detail=str(e))
 
-    except AllProvidersRateLimitedError as e: 
+    except AllProvidersRateLimitedError as e:
         log.warning("/query rejected (all providers rate-limited): %s", e)
+        await _track(request, None, "error", "AllProvidersRateLimitedError")
+        raise HTTPException(status_code=429, detail=str(e), headers=_retry_headers(e.retry_after))
 
-
-        await tracker.log(request.user_id, request.conversation_id, None,
-                           status="error", error_type="AllProvidersRateLimitedError",
-                           cache_scope=request.cache_scope,
-                           estimated_tokens=estimate_tokens(request.messages))
-        raise HTTPException(status_code=429, detail=str(e))
+    except AllProvidersUnavailableError as e:
+        # a dependency problem, not a gateway bug: 503, one log line, no traceback
+        log.error("/query failed (no provider available): %s", e)
+        await _track(request, None, "error", "AllProvidersUnavailableError")
+        raise HTTPException(status_code=503, detail=str(e), headers=_retry_headers(e.retry_after))
 
     except Exception as e:
         log.error("/query failed: %s", e, exc_info=True)
-        await tracker.log(request.user_id, request.conversation_id, None,
-                           status="error", error_type=type(e).__name__,
-                           cache_scope=request.cache_scope,
-                           estimated_tokens=estimate_tokens(request.messages))
+        await _track(request, None, "error", type(e).__name__)
         raise HTTPException(status_code=500, detail=str(e))
+
+    log.info("/query ok: provider=%s model=%s fallback=%s cache_hit=%s latency_ms=%.0f cost_usd=%.6f",
+             response.provider_used, response.model_used, response.was_fallback,
+             response.cache_hit, response.latency_ms, response.cost_usd)
+    await _track(request, response, "success")
+    return response
+
 
 @app.get("/stats/global")
 async def global_stats():

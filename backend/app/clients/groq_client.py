@@ -2,13 +2,29 @@ import time
 import groq
 from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
-from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError
-import logging 
+from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError, ProviderRateLimitedError
+import logging
 log = logging.getLogger(__name__)
 
 settings = get_settings()
 
-client = groq.AsyncGroq(api_key=settings.GROQ_API_KEY)
+# max_retries=0: the gateway owns retry/fallback policy. The SDK's built-in retries
+# (default 2, including on 429) would silently multiply every upstream call and
+# burn the very quota we are trying to protect.
+client = groq.AsyncGroq(
+    api_key=settings.GROQ_API_KEY,
+    max_retries=0,
+    timeout=settings.PROVIDER_TIMEOUT_SECONDS,
+)
+
+
+def _retry_after_seconds(e: Exception) -> float | None:
+    """Groq sends a Retry-After header (seconds) on 429s."""
+    try:
+        value = e.response.headers.get("retry-after")
+        return float(value) if value is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def calculate_cost(prompt_tokens: int, completion_tokens: int) -> float:
@@ -71,15 +87,20 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
             cache_hit=False
         )
 
-    except groq.RateLimitError:
-        raise ProviderUnavailableError("Groq rate limit hit")
+    except groq.RateLimitError as e:
+        # 429 = alive but busy. Keep Groq's own message: it says WHICH limit
+        # (requests/min, tokens/min or tokens/day) and when it resets.
+        detail = (getattr(e, "message", None) or str(e))[:300]
+        retry_after = _retry_after_seconds(e)
+        log.warning("Groq 429 (retry_after=%s): %s", retry_after, detail)
+        raise ProviderRateLimitedError(f"Groq rate limit hit: {detail}", retry_after=retry_after)
     except groq.APIConnectionError:
         raise ProviderUnavailableError("Groq connection failed")
     except groq.BadRequestError as e:
         code = (getattr(e, "body", None) or {}).get("error", {}).get("code")
         if code == "tool_use_failed":
             log.warning("Groq produced an invalid tool call (tool_use_failed); router will retry or fall back")
-           
+
             raise ProviderUnavailableError(f"Groq failed to generate a valid tool call: {str(e)}")
         raise InvalidRequestError(f"Groq rejected the request: {str(e)}")
     except Exception as e:

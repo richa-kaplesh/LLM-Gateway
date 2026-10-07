@@ -1,16 +1,36 @@
 import json
+import re
 import time
 from google import genai
 from google.genai import types
 from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
 from google.genai import errors as genai_errors
-from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError
-import logging 
+from app.clients.exceptions import ProviderUnavailableError, InvalidRequestError, ProviderRateLimitedError
+import logging
 log = logging.getLogger(__name__)
 settings = get_settings()
 
-client = genai.Client(api_key=settings.GEMINI_API_KEY)
+# timeout is in milliseconds; without one a hung connection hangs the request
+client = genai.Client(
+    api_key=settings.GEMINI_API_KEY,
+    http_options=types.HttpOptions(timeout=int(settings.PROVIDER_TIMEOUT_SECONDS * 1000)),
+)
+
+
+def _retry_after_seconds(e: Exception) -> float | None:
+    """Gemini 429s carry a RetryInfo block ("retryDelay": "28s") in the error details."""
+    try:
+        details = getattr(e, "details", None)
+        items = details.get("error", {}).get("details", []) if isinstance(details, dict) else []
+        for item in items:
+            delay = item.get("retryDelay") if isinstance(item, dict) else None
+            if delay:
+                return float(str(delay).rstrip("s"))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    m = re.search(r"retry in ([\d.]+)\s*s", str(e), re.IGNORECASE)
+    return float(m.group(1)) if m else None
 
 
 def calculate_cost(prompt_tokens: int, output_tokens: int) -> float:
@@ -175,7 +195,15 @@ async def complete(request: GatewayRequest) -> GatewayResponse:
     except genai_errors.ClientError as e:
         code = getattr(e, "code", None)
         if code == 429:
-            raise ProviderUnavailableError("Gemini quota exceeded")
+            retry_after = _retry_after_seconds(e)
+            log.warning("Gemini 429 (retry_after=%s): %s", retry_after, str(e)[:300])
+            raise ProviderRateLimitedError(f"Gemini quota exceeded: {str(e)[:300]}", retry_after=retry_after)
+        if code in (401, 403, 404, 408):
+            # bad key, no access to this model, wrong GEMINI_MODEL, or timeout:
+            # a provider-side/config problem, NOT a malformed request, so fail over
+            log.error("Gemini HTTP %s: check GEMINI_API_KEY and GEMINI_MODEL=%s: %s",
+                      code, settings.GEMINI_MODEL, str(e)[:300])
+            raise ProviderUnavailableError(f"Gemini unavailable (HTTP {code}): {str(e)[:300]}")
         raise InvalidRequestError(f"Gemini rejected the request: {str(e)}")
     except genai_errors.ServerError as e:
         raise ProviderUnavailableError(f"Gemini server error: {str(e)}")
