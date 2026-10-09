@@ -34,6 +34,7 @@ class KeyState:
         self.key = key
         self.masked = _mask_key(key)
         self._cooldown_until: float = 0.0   # monotonic timestamp
+        self.auth_failed: bool = False      # True while the key is benched for being rejected
 
     @property
     def available(self) -> bool:
@@ -73,6 +74,8 @@ class KeyManager:
 
     DEFAULT_COOLDOWN_SECONDS = 60.0   # used when Retry-After is absent
     MAX_COOLDOWN_SECONDS = 600.0
+    # A rejected key (401/403/invalid) is benched this long, then retried once.
+    AUTH_FAILED_COOLDOWN_SECONDS = 900.0
     def __init__(self, provider: str, keys: list[str]):
         if not keys:
             raise ValueError(f"KeyManager for {provider!r} received an empty key list")
@@ -100,7 +103,17 @@ class KeyManager:
                 return ks
         return None
 
+    def record_auth_failed(self, ks: KeyState) -> None:
+        ks.auth_failed = True
+        ks.put_on_cooldown(self.AUTH_FAILED_COOLDOWN_SECONDS)
+        log.error(
+            "key %s on provider %s was REJECTED (invalid/unauthorized); benched for %.0f s. "
+            "Fix or remove it in the env var.",
+            ks.masked, self.provider, self.AUTH_FAILED_COOLDOWN_SECONDS,
+        )
+
     def record_success(self, ks: KeyState) -> None:
+        ks.auth_failed = False
         log.info("key %s on provider %s: request succeeded", ks.masked, self.provider)
 
     def record_rate_limited(self, ks: KeyState, retry_after: float | None) -> None:
@@ -137,6 +150,7 @@ class KeyManager:
                 "key": ks.masked,
                 "available": ks.available,
                 "cooldown_remaining_s": round(ks.cooldown_remaining, 1),
+                "auth_failed": ks.auth_failed,
             }
             for ks in self._states
         ]

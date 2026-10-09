@@ -41,6 +41,10 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.router.router import _key_managers
+    for _name, _km in _key_managers.items():
+        log.info("key pool loaded: provider=%s keys=%d %s", _name, _km.key_count(),
+                 [k["key"] for k in _km.status_summary()])
     await init_pool()
     yield
     await close_http()

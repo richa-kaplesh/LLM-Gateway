@@ -7,7 +7,10 @@ from google.genai import types
 from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
 from google.genai import errors as genai_errors
-from app.clients.exceptions import ProviderUnavailableError, ProviderConnectionError, InvalidRequestError, ProviderRateLimitedError
+from app.clients.exceptions import (
+    ProviderUnavailableError, ProviderConnectionError, InvalidRequestError,
+    ProviderRateLimitedError, ProviderKeyError,
+)
 import logging
 log = logging.getLogger(__name__)
 settings = get_settings()
@@ -59,6 +62,13 @@ def _make_client(api_key: str) -> genai.Client:
         api_key=api_key,
         http_options=types.HttpOptions(timeout=int(settings.PROVIDER_TIMEOUT_SECONDS * 1000)),
     )
+
+
+def _is_bad_key(e: Exception) -> bool:
+    """Gemini reports an invalid or expired key as HTTP 400 (reason API_KEY_INVALID),
+    not 401, so check the message too."""
+    msg = str(e)
+    return "API_KEY_INVALID" in msg or "API key not valid" in msg or "API key expired" in msg
 
 
 def _retry_after_seconds(e: Exception) -> float | None:
@@ -245,20 +255,22 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
             retry_after = _retry_after_seconds(e)
             log.warning("Gemini 429 (retry_after=%s): %s", retry_after, str(e)[:300])
             raise ProviderRateLimitedError(f"Gemini quota exceeded: {str(e)[:300]}", retry_after=retry_after)
-        if code in (401, 403, 404):
-            # Bad key, no access to this model, or wrong GEMINI_MODEL: a
-            # provider-side config problem. Do NOT fall back — the same bad
-            # key/model would fail on retry too.
-            log.error("Gemini HTTP %s: check GEMINI_API_KEY and GEMINI_MODEL=%s: %s",
+        if code in (401, 403, 404) or _is_bad_key(e):
+            # Bad/expired key, no access to this model for this key's project, or a wrong
+            # GEMINI_MODEL. Treated per KEY: the router benches this key and tries the next.
+            # If every key fails this way the final error says so (and names the cause).
+            log.error("Gemini key unusable (HTTP %s) with GEMINI_MODEL=%s: %s",
                       code, settings.GEMINI_MODEL, str(e)[:300])
-            raise ProviderUnavailableError(f"Gemini unavailable (HTTP {code}): {str(e)[:300]}")
+            raise ProviderKeyError(f"Gemini key unusable (HTTP {code}): {str(e)[:300]}")
         if code == 408:
             # Timeout: the network timed out, not a server problem. The other
             # provider may respond fine — treat as a transient connection error.
             raise ProviderConnectionError(f"Gemini request timed out (HTTP 408): {str(e)[:300]}")
         raise InvalidRequestError(f"Gemini rejected the request: {str(e)}")
     except genai_errors.ServerError as e:
-        raise ProviderUnavailableError(f"Gemini server error: {str(e)}")
+        # 5xx (e.g. 503 "model is experiencing high demand") is a temporary Google-side
+        # problem. Treat it like a connection error so the router falls back to Groq.
+        raise ProviderConnectionError(f"Gemini server error (HTTP {getattr(e, 'code', '5xx')}): {str(e)[:300]}")
     except Exception as e:
         # httpcore.ReadTimeout and other network/connection errors bubble up
         # here as plain Exceptions (the SDK wraps them without re-typing).

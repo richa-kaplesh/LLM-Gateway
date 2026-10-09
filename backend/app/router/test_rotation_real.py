@@ -134,3 +134,46 @@ async def test_server_error_still_stops_immediately(world):
     with pytest.raises(ex.AllProvidersUnavailableError, match="Provider 'groq' is down"):
         await _go("groq")
     assert all(p == "groq" for p, _ in calls)
+
+
+# ── a rejected key is skipped, not fatal ───────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_bad_key_is_skipped_and_next_key_on_same_provider_is_used(world):
+    calls = world({"gA": ex.ProviderKeyError("401 invalid api key"), "*": OK}, {"*": OK})
+    resp = await _go("groq")
+    assert resp.provider_used == "groq"
+    assert ("groq", "gB") in calls
+    km = R._key_managers["groq"]
+    assert [k["auth_failed"] for k in km.status_summary()] == [True, False, False]
+    assert breakers["groq"].state == "closed" and breakers["groq"].consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_bad_key_is_not_retried_while_benched(world):
+    calls = world({"gA": ex.ProviderKeyError("401"), "*": OK}, {"*": OK})
+    await _go("groq")
+    await _go("groq")
+    assert sum(1 for c in calls if c == ("groq", "gA")) == 1
+
+
+@pytest.mark.asyncio
+async def test_all_keys_of_a_provider_rejected_falls_back_to_the_other_provider(world):
+    world({"*": ex.ProviderKeyError("401")}, {"*": OK})
+    resp = await _go("groq")
+    assert resp.provider_used == "gemini"
+
+
+@pytest.mark.asyncio
+async def test_all_keys_everywhere_rejected_gives_clear_503(world):
+    world({"*": ex.ProviderKeyError("401 invalid api key")}, {"*": ex.ProviderKeyError("400 API key not valid")})
+    with pytest.raises(ex.AllProvidersUnavailableError, match="key\\(s\\) rejected"):
+        await _go("groq")
+
+
+@pytest.mark.asyncio
+async def test_bad_key_on_fallback_side_is_skipped_too(world):
+    calls = world({"*": ex.ProviderRateLimitedError("429", 30)}, {"mA": ex.ProviderKeyError("bad"), "*": OK})
+    resp = await _go("groq")
+    assert resp.provider_used == "gemini"
+    assert ("gemini", "mB") in calls

@@ -2,7 +2,10 @@ import time
 import groq
 from app.core.config import get_settings
 from app.models.schemas import GatewayRequest, GatewayResponse
-from app.clients.exceptions import ProviderUnavailableError, ProviderConnectionError, InvalidRequestError, ProviderRateLimitedError
+from app.clients.exceptions import (
+    ProviderUnavailableError, ProviderConnectionError, InvalidRequestError,
+    ProviderRateLimitedError, ProviderKeyError,
+)
 import logging
 log = logging.getLogger(__name__)
 
@@ -111,6 +114,12 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
 
             raise ProviderUnavailableError(f"Groq failed to generate a valid tool call: {str(e)}")
         raise InvalidRequestError(f"Groq rejected the request: {str(e)}")
+    except (groq.AuthenticationError, groq.PermissionDeniedError) as e:
+        # 401/403: this KEY is bad. The router benches it and tries the next one.
+        raise ProviderKeyError(f"Groq rejected the API key (HTTP {getattr(e, 'status_code', '401/403')}): {str(e)[:200]}")
+    except groq.InternalServerError as e:
+        # 5xx (e.g. 503 "over capacity") is a temporary Groq-side problem: fall back to Gemini.
+        raise ProviderConnectionError(f"Groq server error (HTTP {getattr(e, 'status_code', '5xx')}): {str(e)[:300]}")
     except Exception as e:
         log.error("Groq unexpected error", exc_info=True)
         raise ProviderUnavailableError(f"Groq error: {str(e)}")

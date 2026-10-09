@@ -5,6 +5,14 @@ class ProviderUnavailableError(Exception):
     pass
 
 
+class ProviderKeyError(ProviderUnavailableError):
+    """THIS API KEY can't be used: rejected (401/403, 'API key not valid') or no access
+    to the configured model. The provider itself is fine and its other keys may work,
+    so the router disables just this key for a while and tries the next one. Only when
+    every key of a provider is rejected does that provider count as unusable."""
+    pass
+
+
 class ProviderConnectionError(ProviderUnavailableError):
     """Network-level failure: DNS resolution failed, TCP connection refused,
     or request timed out before the provider responded.  The provider itself
@@ -102,6 +110,9 @@ def classify_error(e: Exception) -> str:
         # The breaker paused a provider after repeated 429s — treat as rate-limit
         # so the caller rotates to another key/provider instead of stopping.
         return "rate_limit"
+    if isinstance(e, ProviderKeyError):
+        # This key was rejected. Skip the key (not the provider) and try the next one.
+        return "bad_key"
     if isinstance(e, ProviderConnectionError):
         # Network-level failure: the provider may be fine, the network isn't.
         # Try the other provider; don't penalise this key.

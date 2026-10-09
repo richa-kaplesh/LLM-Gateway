@@ -1,15 +1,26 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 import os
+import re
+import os
+
 
 
 def _parse_key_list(env_value: str) -> list[str]:
-    """Parse a comma-separated list of API keys.
-    Strips whitespace around each entry and drops empty entries, so small
-    formatting mistakes in .env (trailing comma, stray space) don't break things.
-    """
-    return [k.strip() for k in env_value.split(",") if k.strip()]
+    """Parse a list of API keys, tolerating the usual copy/paste mistakes.
 
+    Keys may be separated by commas, semicolons, spaces or newlines (one key per line is
+    common when pasting into a dashboard). Surrounding quotes/brackets are stripped and
+    duplicates are dropped. Real API keys never contain these characters, so this cannot
+    split a genuine key. (A key list that is NOT split correctly turns into one garbage
+    'key' or into keys with stray quote characters, and every call using them fails.)
+    """
+    keys: list[str] = []
+    for part in re.split(r"[,;\s]+", env_value or ""):
+        key = part.strip().strip("\"'`[]()")
+        if key and key not in keys:
+            keys.append(key)
+    return keys
 
 class Settings(BaseSettings):
     # ── Single-key vars (kept for backward compatibility) ──────────────────
@@ -81,8 +92,9 @@ class Settings(BaseSettings):
             keys = _parse_key_list(self.GROQ_API_KEYS)
             if keys:
                 return keys
-        if self.GROQ_API_KEY:
-            return [self.GROQ_API_KEY]
+        keys = _parse_key_list(self.GROQ_API_KEY)
+        if keys:
+            return keys
         raise ValueError(
             "No Groq API key found. Set GROQ_API_KEYS (comma-separated) or GROQ_API_KEY."
         )
@@ -99,8 +111,9 @@ class Settings(BaseSettings):
             keys = _parse_key_list(self.GEMINI_API_KEYS)
             if keys:
                 return keys
-        if self.GEMINI_API_KEY:
-            return [self.GEMINI_API_KEY]
+        keys = _parse_key_list(self.GEMINI_API_KEY)
+        if keys:
+            return keys
         raise ValueError(
             "No Gemini API key found. Set GEMINI_API_KEYS (comma-separated) or GEMINI_API_KEY."
         )
