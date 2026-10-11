@@ -55,6 +55,21 @@ def normalize_tool_calls(tool_calls):
     ]
 
 
+def _clean_messages(messages: list[dict]) -> list[dict]:
+    """Drop gateway-only fields before forwarding. `thought_signature` is Gemini's;
+    it rides on assistant tool_calls and Groq doesn't know it (unknown field -> 400)."""
+    cleaned = []
+    for m in messages:
+        calls = m.get("tool_calls")
+        if calls:
+            m = {**m, "tool_calls": [
+                {k: v for k, v in c.items() if k != "thought_signature"} if isinstance(c, dict) else c
+                for c in calls
+            ]}
+        cleaned.append(m)
+    return cleaned
+
+
 async def complete(request: GatewayRequest, api_key: str | None = None) -> GatewayResponse:
     """Call Groq.  Pass ``api_key`` to use a specific key; omit to fall back to
     the single legacy key in settings (backward-compatible behaviour)."""
@@ -65,7 +80,7 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
 
         kwargs = {
             "model": settings.GROQ_MODEL,
-            "messages": request.messages,
+            "messages": _clean_messages(request.messages),
         }
         if request.tools is not None:
             kwargs["tools"] = request.tools

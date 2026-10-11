@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import re
 import time
@@ -97,8 +99,33 @@ def _parse_args(raw):
     """OpenAI-style tool_calls store arguments as a JSON string. Gemini
     wants a plain dict. Handle both in case the caller already parsed it."""
     if isinstance(raw, str):
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            # the caller's input is malformed: that is a 400, not a provider failure
+            raise InvalidRequestError(f"tool_call arguments are not valid JSON: {e}")
     return raw
+
+
+def _encode_signature(sig: bytes | None) -> str | None:
+    """Gemini's thought_signature is opaque BINARY. It can't travel in a JSON
+    response as-is (Pydantic would try to decode it as UTF-8 and fail), so it
+    leaves the gateway as base64 text."""
+    if not sig:
+        return None
+    return base64.b64encode(sig).decode("ascii")
+
+
+def _decode_signature(sig) -> bytes | None:
+    """Inverse of _encode_signature, for when the caller replays a tool call."""
+    if not sig:
+        return None
+    if isinstance(sig, (bytes, bytearray)):
+        return bytes(sig)
+    try:
+        return base64.b64decode(sig, validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        raise InvalidRequestError("tool_call thought_signature is not valid base64")
 
 
 def convert_messages(messages: list[dict]):
@@ -128,7 +155,7 @@ def convert_messages(messages: list[dict]):
                         name=call["function"]["name"],
                         args=_parse_args(call["function"]["arguments"])
                     )
-                    part.thought_signature =call.get("thought_signature")
+                    part.thought_signature = _decode_signature(call.get("thought_signature"))
                     parts.append(part)
                 
                 contents.append(types.Content(role="model", parts=parts))
@@ -176,7 +203,7 @@ def normalize_tool_calls(parts):
                 "name": call.name,
                 "arguments": json.dumps(call.args)
             },
-            "thought_signature": part.thought_signature  
+            "thought_signature": _encode_signature(part.thought_signature),
         })
     return result
 
@@ -249,6 +276,10 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
             cache_hit=False
         )
 
+    except InvalidRequestError:
+        # raised by our own message conversion; must not be re-labelled as a
+        # provider outage by the generic handler below
+        raise
     except genai_errors.ClientError as e:
         code = getattr(e, "code", None)
         if code == 429:

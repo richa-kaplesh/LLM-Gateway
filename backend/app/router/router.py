@@ -359,8 +359,69 @@ def _all_sides_dry(km_primary: KeyManager, km_fallback: KeyManager, circuit_open
     return True
 
 
+async def _route_pinned(provider: str, request: GatewayRequest, estimated_tokens: int) -> GatewayResponse:
+    """Rotate keys on ONE provider only; never fall back to the other.
+
+    Used when a conversation already has tool history and is pinned to Groq. Gemini rejects
+    replayed function calls that lack the thought_signature only Gemini produces, so a
+    Groq-made history cannot safely move to Gemini. (The reverse is fine: the Groq client
+    strips thought_signature, so Gemini -> Groq fallback keeps using the normal rotation.)
+    """
+    km = _key_managers[provider]
+    last_rl: ProviderRateLimitedError | None = None
+    key_errors: list[ProviderKeyError] = []
+
+    ks = km.next_available()
+    if ks is None:
+        release_capacity(provider, estimated_tokens)      # reserved in route() but never used
+        log.warning("all %s keys are on cooldown at start", provider)
+    first_attempt = True
+    while ks is not None:
+        log.info("routing request (pinned, tool history): provider=%s key=%s", provider, ks.masked)
+        try:
+            resp = await _attempt_provider(provider, request, estimated_tokens,
+                                           reserve=not first_attempt, api_key=ks.key)
+            km.record_success(ks)
+            return resp
+        except InvalidRequestError:
+            raise
+        except ProviderKeyError as e:
+            km.record_auth_failed(ks)
+            key_errors.append(e)
+        except ProviderRateLimitedError as e:
+            km.record_rate_limited(ks, e.retry_after)
+            last_rl = e
+        except CircuitOpenError as e:
+            raise AllProvidersUnavailableError(
+                f"{provider} is unavailable and this conversation cannot move to another provider "
+                f"(it has tool-call history): {e}", retry_after=e.retry_after)
+        except ProviderConnectionError as e:
+            raise AllProvidersUnavailableError(
+                f"{provider} is unreachable and this conversation cannot move to another provider "
+                f"(it has tool-call history): {e}", retry_after=None)
+        except Exception as e:
+            raise ProviderDownError(provider, e) from e
+        first_attempt = False
+        ks = km.next_available(skip_key=ks.key)
+
+    if last_rl is None and key_errors:
+        raise AllProvidersUnavailableError(
+            f"{provider}: {len(key_errors)} key(s) rejected, last error: {key_errors[-1]}")
+    raise AllProvidersRateLimitedError(
+        f"All {provider} keys are rate-limited and this conversation cannot move to another "
+        f"provider (it has tool-call history). {last_rl or ''}".strip(),
+        retry_after=km.soonest_retry_seconds(),
+    )
+
+
 async def route(request: GatewayRequest) -> GatewayResponse:
-    cache = get_cache_for(request)
+    tool_history = _has_tool_history(request.messages)
+
+    # The cache key is only the last user message. A tool-enabled request, or one that is
+    # mid tool-call loop, depends on far more than that (tools, history, thought_signature),
+    # so serving or storing it from the cache would replay another conversation's tool calls.
+    use_cache = not (request.tools or request.is_tool_related or tool_history)
+    cache = get_cache_for(request) if use_cache else None
     lookup = None
     if cache:
         try:
@@ -380,7 +441,7 @@ async def route(request: GatewayRequest) -> GatewayResponse:
 
     provider = get_provider_for_conversation(
         request.conversation_id, estimated_tokens,
-        must_stick=_has_tool_history(request.messages),
+        must_stick=tool_history,
     )
     if provider is None:
         raise AllProvidersRateLimitedError(
@@ -390,7 +451,10 @@ async def route(request: GatewayRequest) -> GatewayResponse:
 
     was_fallback = False
     try:
-        response = await _route_with_key_rotation(provider, request, estimated_tokens)
+        if tool_history and provider == "groq":
+            response = await _route_pinned(provider, request, estimated_tokens)
+        else:
+            response = await _route_with_key_rotation(provider, request, estimated_tokens)
 
         # Detect whether we ended up on the fallback provider so we can re-pin
         if response.provider_used != provider:
@@ -413,7 +477,7 @@ async def route(request: GatewayRequest) -> GatewayResponse:
 
     if cache and lookup and lookup.embedding:
         emb = lookup.embedding
-        cache.set(request, response, emb)        # store the pure LLM response first
+        cache.set(request, response.model_copy(deep=True), emb)   # store a pure copy of the LLM response
         # a miss really costs the embedding call on top of the LLM call
         response.embed_latency_ms = emb.latency_ms
         response.embed_cost_usd = emb.cost_usd

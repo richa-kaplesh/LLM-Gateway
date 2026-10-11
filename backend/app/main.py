@@ -156,6 +156,16 @@ async def handle_query(request: GatewayRequest):
         await _track(request, None, "error", type(e).__name__)
         raise HTTPException(status_code=500, detail=str(e))
 
+    # FastAPI serializes the return value AFTER this function returns, outside every
+    # try/except here, so a non-JSON value would become a bare 500 while the request is
+    # still logged as a success. Serialize now so that failure is caught and tracked.
+    try:
+        response.model_dump(mode="json")
+    except Exception as e:
+        log.error("/query response is not JSON-serializable: %s: %s", type(e).__name__, e, exc_info=True)
+        await _track(request, None, "error", "ResponseSerializationError")
+        raise HTTPException(status_code=500, detail="Gateway produced a response that could not be serialized")
+
     log.info("/query ok: provider=%s model=%s fallback=%s cache_hit=%s latency_ms=%.0f cost_usd=%.6f",
              response.provider_used, response.model_used, response.was_fallback,
              response.cache_hit, response.latency_ms, response.cost_usd)

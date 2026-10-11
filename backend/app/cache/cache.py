@@ -106,7 +106,7 @@ class SemanticCache:
                     cost_usd=emb.cost_usd,
                     latency_ms=emb.latency_ms + lookup_ms,
                     embed_latency_ms=emb.latency_ms, embed_cost_usd=emb.cost_usd,
-                    cache_hit=True, cache_scope=request.cache_scope,
+                    cache_hit=True,
                 ),
                 embedding=emb, max_similarity=max_sim,
             )
@@ -118,6 +118,8 @@ class SemanticCache:
         query_text = _extract_query_text(request)
         if not query_text or embedding is None:
             return
+        if response.tool_calls:
+            return      # a tool call belongs to ONE conversation's history; never replay it to another
         if len(self.queries) >= settings.CACHE_MAX_SIZE:
             self.queries.pop(0)
             self.embeddings.pop(0)
