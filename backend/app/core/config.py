@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     # Rough allowance for the tokens the model will GENERATE (TPM counts input + output)
     OUTPUT_TOKEN_ALLOWANCE: int = 512
 
+    # When every key is merely out of budget / cooling down, wait up to this long for one to
+    # free up instead of failing the request. 0 = fail immediately with 429 + Retry-After.
+    MAX_QUEUE_WAIT_SECONDS: float = 20.0
+
     # Hard timeout for one upstream call; without it a hung provider hangs the request
     PROVIDER_TIMEOUT_SECONDS: float = 60.0
 

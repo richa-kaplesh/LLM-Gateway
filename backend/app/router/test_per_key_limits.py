@@ -143,3 +143,55 @@ async def test_tool_history_pinned_conversation_uses_other_groq_keys(world):
 def test_weights_follow_key_count(world):
     w = R._weights()
     assert w["groq"] == 2 * 3 and w["gemini"] == 1 * 2
+
+
+@pytest.mark.asyncio
+async def test_one_circuit_open_other_provider_keys_dry_is_429_not_503(world):
+    """Production log: 'no provider available: gemini circuit is open'. Groq keys were only
+    out of per-key budget (not down), so the right answer is 429 + Retry-After, not 503."""
+    breakers["gemini"].state = "open"
+    import time as _t
+    breakers["gemini"].opened_at = _t.monotonic()
+    for k in ("gA", "gB", "gC"):
+        for _ in range(2):
+            B.reserve_capacity("groq", 10, k)
+    with pytest.raises(ex.AllProvidersRateLimitedError) as e:
+        await _go("c", provider="gemini")
+    assert e.value.retry_after is not None
+
+
+@pytest.mark.asyncio
+async def test_one_circuit_open_other_provider_keys_cooling_is_429(world):
+    breakers["gemini"].state = "open"
+    import time as _t
+    breakers["gemini"].opened_at = _t.monotonic()
+    for ks in R._key_managers["groq"].keys():
+        ks.put_on_cooldown(30)
+    with pytest.raises(ex.AllProvidersRateLimitedError):
+        await _go("c", provider="gemini")
+
+
+@pytest.mark.asyncio
+async def test_busy_keys_wait_for_capacity_instead_of_failing(world, monkeypatch):
+    """Every key is out of RPM but one refills within ~1 s: the request waits and is answered."""
+    monkeypatch.setattr(B.settings, "GROQ_RPM", 60)         # refills 1 request/second/key
+    monkeypatch.setattr(B.settings, "GEMINI_RPM", 60)
+    monkeypatch.setattr(R.settings, "MAX_QUEUE_WAIT_SECONDS", 5.0)
+    B.reset_buckets()
+    for p, keys in (("groq", ("gA", "gB", "gC")), ("gemini", ("mA", "mB"))):
+        for k in keys:
+            B.buckets_for(p, k)[0].tokens = 0.0
+    resp = await _go("c")
+    assert resp.content == "hi"
+
+
+@pytest.mark.asyncio
+async def test_wait_longer_than_cap_fails_fast_with_429(world, monkeypatch):
+    monkeypatch.setattr(R.settings, "MAX_QUEUE_WAIT_SECONDS", 0.2)
+    for k in ("gA", "gB", "gC"):
+        for _ in range(2):
+            B.reserve_capacity("groq", 10, k)
+    for k in ("mA", "mB"):
+        B.reserve_capacity("gemini", 10, k)
+    with pytest.raises(ex.AllProvidersRateLimitedError):
+        await _go("c")

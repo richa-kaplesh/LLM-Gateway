@@ -250,29 +250,27 @@ class TestRouteWithKeyRotation:
         assert calls == ["groq", "gemini"]
 
     @pytest.mark.asyncio
-    async def test_3b_server_error_stops_immediately(self):
-        """groq returns a 5xx / auth error — that IS a hard stop.
-        Gemini should NOT be tried (the problem is with groq's config/server,
-        not the network)."""
+    async def test_3b_server_error_falls_back_to_other_provider(self):
+        """groq returns an unclassified server error. The request must still be answered by
+        gemini: the gateway only fails when NOTHING can serve it."""
         calls = []
 
         async def mock_attempt(provider, request, estimated_tokens, reserve, api_key):
             calls.append(provider)
             if provider == "groq":
-                raise _server_down()     # 5xx — hard stop
+                raise _server_down()
             return _make_response("gemini")
 
         managers = _make_managers(["groq_k1"], ["gem_k1"])
 
         with patch.object(_router_module, "_attempt_provider", side_effect=mock_attempt), \
              patch.object(_router_module, "_key_managers", managers):
-            with pytest.raises(ProviderDownError) as exc_info:
-                await _router_module._route_with_key_rotation(
-                    "groq", _make_request(), estimated_tokens=100,
-                )
+            resp = await _router_module._route_with_key_rotation(
+                "groq", _make_request(), estimated_tokens=100,
+            )
 
-        assert exc_info.value.provider == "groq"
-        assert calls == ["groq"]   # gemini was never tried
+        assert resp.provider_used == "gemini"
+        assert calls == ["groq", "gemini"]
 
     @pytest.mark.asyncio
     async def test_4_all_keys_exhausted(self):
@@ -307,9 +305,8 @@ class TestRouteWithKeyRotation:
         assert "gem_k2" in tried_keys
 
     @pytest.mark.asyncio
-    async def test_5_provider_down_on_fallback_stops_immediately(self):
-        """groq k1 → 429.  gemini returns a DOWN error → ProviderDownError
-        for gemini; groq k2 is NEVER tried."""
+    async def test_5_provider_down_on_fallback_still_tries_other_groq_key(self):
+        """groq k1 -> 429, gemini -> server error. groq k2 must still be tried and answer."""
         calls = []
 
         async def mock_attempt(provider, request, estimated_tokens, reserve, api_key):
@@ -324,10 +321,22 @@ class TestRouteWithKeyRotation:
 
         with patch.object(_router_module, "_attempt_provider", side_effect=mock_attempt), \
              patch.object(_router_module, "_key_managers", managers):
-            with pytest.raises(ProviderDownError) as exc_info:
+            resp = await _router_module._route_with_key_rotation(
+                "groq", _make_request(), estimated_tokens=100,
+            )
+
+        assert resp.provider_used == "groq"
+        assert ("groq", "groq_k2") in calls
+
+    @pytest.mark.asyncio
+    async def test_5b_everything_failing_is_503_naming_the_causes(self):
+        async def mock_attempt(provider, request, estimated_tokens, reserve, api_key):
+            raise _server_down()
+
+        managers = _make_managers(["groq_k1"], ["gem_k1"])
+        with patch.object(_router_module, "_attempt_provider", side_effect=mock_attempt), \
+             patch.object(_router_module, "_key_managers", managers):
+            with pytest.raises(AllProvidersUnavailableError, match="groq.*gemini"):
                 await _router_module._route_with_key_rotation(
                     "groq", _make_request(), estimated_tokens=100,
                 )
-
-        assert exc_info.value.provider == "gemini"
-        assert ("groq", "groq_k2") not in calls   # groq k2 was never tried

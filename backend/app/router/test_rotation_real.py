@@ -125,12 +125,17 @@ async def test_unused_reservation_is_refunded_when_keys_on_cooldown(world):
 
 
 @pytest.mark.asyncio
-async def test_server_error_still_stops_immediately(world):
-    """Existing design decision (see test_multikey::test_3b): 5xx/auth => no fallback."""
-    calls = world({"*": ex.ProviderUnavailableError("401 invalid api key")}, {"*": OK})
-    with pytest.raises(ex.AllProvidersUnavailableError, match="Provider 'groq' is down"):
+async def test_server_error_on_one_provider_falls_back_to_the_other(world):
+    calls = world({"*": ex.ProviderUnavailableError("500 server error")}, {"*": OK})
+    resp = await _go("groq")
+    assert resp.provider_used == "gemini"
+
+
+@pytest.mark.asyncio
+async def test_all_providers_failing_is_503_not_429(world):
+    world({"*": ex.ProviderUnavailableError("500 boom")}, {"*": ex.ProviderConnectionError("timeout")})
+    with pytest.raises(ex.AllProvidersUnavailableError, match="boom|timeout"):
         await _go("groq")
-    assert all(p == "groq" for p, _ in calls)
 
 
 # ── a rejected key is skipped, not fatal ───────────────────────────────────

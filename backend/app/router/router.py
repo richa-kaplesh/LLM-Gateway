@@ -240,6 +240,10 @@ async def _route_with_key_rotation(
     # Rejected keys per provider. One bad key must not take a provider down: it is
     # benched and the next key is tried; only if ALL keys are rejected is the provider out.
     key_errors: dict[str, list[ProviderKeyError]] = {}
+    # Providers that failed with a transient/unclassified error (timeout, 5xx, ...). They are
+    # NOT fatal for the request: the other provider is still tried. Only if nothing else
+    # works does this become a 503 that names the cause.
+    failed: dict[str, Exception] = {}
 
     tried_primary_key: str | None = None
     tried_fallback_key: str | None = None
@@ -275,19 +279,23 @@ async def _route_with_key_rotation(
         except ProviderConnectionError as e:
             # Transient failure (DNS/TCP/timeout/5xx). Don't penalise the key
             # (it may recover); go try the other provider.
+            failed[primary] = e
             log.warning("rotation: %s transient error; falling back to %s: %s", primary, fallback, e)
         except Exception as e:
-            # Server-side/config failure we can't classify - stop immediately
-            raise ProviderDownError(primary, e) from e
+            # Anything else this provider threw: still not a reason to give up while the
+            # other provider (and its keys) may work.
+            failed[primary] = e
+            log.error("rotation: %s failed with %s: %s; falling back to %s",
+                      primary, type(e).__name__, e, fallback)
         break
 
     # Alternating loop: fallback -> primary -> fallback -> ...
     # Each iteration picks one key from whichever side is "next".
     turn = fallback      # who we are about to try
     for _ in range(2 * (km_primary.key_count() + km_fallback.key_count()) + 2):
-        if len(circuit_open) == 2:
+        if len(set(circuit_open) | set(failed)) == 2:
             break
-        if turn in circuit_open:
+        if turn in circuit_open or turn in failed:   # breaker open, or it just errored: skip its other keys
             turn = _other_provider(turn)
             continue
 
@@ -298,7 +306,7 @@ async def _route_with_key_rotation(
         if ks is None:
             log.info("no available keys left on %s, switching side", turn)
             turn = _other_provider(turn)
-            if _all_sides_dry(km_primary, km_fallback, circuit_open, estimated_tokens):
+            if _all_sides_dry(km_primary, km_fallback, {**circuit_open, **failed}, estimated_tokens):
                 break
             continue
 
@@ -335,16 +343,23 @@ async def _route_with_key_rotation(
         except ProviderConnectionError as e:
             # Transient error in the alternating loop - log and keep rotating
             # (other keys/providers may work; don't stop here).
+            failed[turn] = e
             log.warning("rotation: %s transient error; continuing rotation: %s", turn, e)
         except Exception as e:
-            # Server-side/config failure we can't classify - stop immediately
-            raise ProviderDownError(turn, e) from e
+            failed[turn] = e
+            log.error("rotation: %s failed with %s: %s; continuing rotation", turn, type(e).__name__, e)
 
         turn = _other_provider(turn)
 
     # Nothing could serve the request.
     notes = [f"{p}: {len(errs)} key(s) rejected, last error: {errs[-1]}" for p, errs in key_errors.items()]
-    if (circuit_open or key_errors) and last_rl_primary is None and last_rl_fallback is None:
+    notes += [f"{p}: {type(e).__name__}: {e}" for p, e in failed.items()]
+    # A provider that is merely busy (keys cooling down or out of their own RPM/TPM budget)
+    # makes this a 429 with a Retry-After, not a 503. Only when every provider is really out
+    # (breaker open, or all its keys rejected) is it "unavailable".
+    busy = [name for name in (primary, fallback)
+            if name not in circuit_open and name not in failed and any(not ks.auth_failed for ks in _key_managers[name].keys())]
+    if (circuit_open or key_errors or failed) and not busy and last_rl_primary is None and last_rl_fallback is None:
         parts = [str(e) for e in circuit_open.values()] + notes
         hints = [e.retry_after for e in circuit_open.values() if e.retry_after is not None]
         log.error("no provider available: %s", "; ".join(parts))
@@ -457,41 +472,54 @@ async def route(request: GatewayRequest) -> GatewayResponse:
     if estimated_tokens > max_request_tokens():
         raise TooLongError(f"Prompt is too long ({estimated_tokens} tokens) for any configured provider")
 
-    provider = get_provider_for_conversation(
-        request.conversation_id, estimated_tokens,
-        fits=lambda p: _provider_fits(p, estimated_tokens),
-        must_stick=tool_history, weights=_weights(),
-    )
-    if provider is None:
-        raise AllProvidersRateLimitedError(
-            "Both providers are rate-limited right now. Try again shortly.",
-            retry_after=min((w for w in (_provider_wait(p, estimated_tokens) for p in ("groq", "gemini"))
-                             if w is not None), default=None),
-        )
-
+    # If every key is merely busy (out of its own budget, or cooling down after a 429), waiting
+    # a few seconds beats failing: wait up to MAX_QUEUE_WAIT_SECONDS for one to free up.
+    deadline = time.monotonic() + settings.MAX_QUEUE_WAIT_SECONDS
     was_fallback = False
-    try:
-        if tool_history and provider == "groq":
-            response = await _route_pinned(provider, request, estimated_tokens)
-        else:
-            response = await _route_with_key_rotation(provider, request, estimated_tokens)
-
-        # Detect whether we ended up on the fallback provider so we can re-pin
-        if response.provider_used != provider:
-            was_fallback = True
-            pin_conversation(request.conversation_id, response.provider_used)
-            log.info("fallback succeeded: conversation=%s re-pinned from %s to %s",
-                     request.conversation_id, provider, response.provider_used)
-
-    except ProviderDownError as e:
-        # A provider returned a non-rate-limit failure.  Do NOT rotate or fall back.
-        log.error("provider %s is down: %s", e.provider, e.cause)
-        raise AllProvidersUnavailableError(
-            f"Provider {e.provider!r} is down: {e.cause}",
-            retry_after=None,
+    while True:
+        provider = get_provider_for_conversation(
+            request.conversation_id, estimated_tokens,
+            fits=lambda p: _provider_fits(p, estimated_tokens),
+            must_stick=tool_history, weights=_weights(),
         )
-    except InvalidRequestError:
-        raise
+        if provider is None:
+            wait = min((w for w in (_provider_wait(p, estimated_tokens) for p in ("groq", "gemini"))
+                        if w is not None), default=None)
+            if wait is not None and time.monotonic() + wait <= deadline:
+                log.info("all keys busy; waiting %.1f s for capacity", wait)
+                await asyncio.sleep(wait + 0.05)
+                continue
+            raise AllProvidersRateLimitedError(
+                "Every key on both providers is rate-limited right now. Try again shortly.",
+                retry_after=wait,
+            )
+        try:
+            if tool_history and provider == "groq":
+                response = await _route_pinned(provider, request, estimated_tokens)
+            else:
+                response = await _route_with_key_rotation(provider, request, estimated_tokens)
+
+            # Detect whether we ended up on the fallback provider so we can re-pin
+            if response.provider_used != provider:
+                was_fallback = True
+                pin_conversation(request.conversation_id, response.provider_used)
+                log.info("fallback succeeded: conversation=%s re-pinned from %s to %s",
+                         request.conversation_id, provider, response.provider_used)
+            break
+        except AllProvidersRateLimitedError as e:
+            if e.retry_after is not None and time.monotonic() + e.retry_after <= deadline:
+                log.info("all keys busy after rotation; waiting %.1f s then retrying", e.retry_after)
+                await asyncio.sleep(e.retry_after + 0.05)
+                continue
+            raise
+        except ProviderDownError as e:
+            log.error("provider %s is down: %s", e.provider, e.cause)
+            raise AllProvidersUnavailableError(
+                f"Provider {e.provider!r} is down: {e.cause}",
+                retry_after=None,
+            )
+        except InvalidRequestError:
+            raise
 
     response.was_fallback = was_fallback
 
