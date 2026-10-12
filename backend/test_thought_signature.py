@@ -207,6 +207,75 @@ def test_handler_guard_reports_serialization_failure():
     assert tracked == [("error", "ResponseSerializationError")], tracked   # NOT logged as success
 
 
+# 8 ─ a LOCAL rpm/tpm budget miss must not bench API keys (the 503 cascade seen on Render) ───
+def _reset_router_state():
+    from app.router.bucket import tpm_buckets, rpm_buckets
+    from app.router.circuit_breaker import breakers
+    for b in (*tpm_buckets.values(), *rpm_buckets.values()):
+        b.tokens = b.capacity
+    for br in breakers.values():
+        br.state, br.consecutive_failures, br.paused_until = "closed", 0, 0.0
+    for km in router_mod._key_managers.values():
+        for ks in km._states:
+            ks._cooldown_until = 0.0
+
+
+def test_local_capacity_miss_does_not_bench_keys():
+    from app.router.bucket import tpm_buckets
+    from app.router.circuit_breaker import breakers
+    _reset_router_state()
+
+    async def groq_ok(request, api_key=None):
+        return _resp("groq", content="ok")
+
+    async def gemini_never(request, api_key=None):
+        raise AssertionError("gemini circuit is open: must not be called")
+
+    router_mod.CLIENTS = {"groq": fake_client("groq_client", groq_ok),
+                          "gemini": fake_client("gemini_client", gemini_never)}
+    try:
+        breakers["gemini"].state, breakers["gemini"].opened_at = "open", breakers["gemini"]._now()
+        tpm_buckets["groq"].tokens = 0                                   # local budget spent
+        mk = lambda c: GatewayRequest(conversation_id=c, user_id="u",
+                                      messages=[{"role": "user", "content": "hi"}])
+        try:
+            asyncio.run(router_mod.route(mk("cap-1")))
+        except AllProvidersRateLimitedError as e:
+            assert e.retry_after and e.retry_after > 0, "must give a real Retry-After"
+        else:
+            raise AssertionError("expected AllProvidersRateLimitedError")
+        assert all(ks.available for ks in router_mod._key_managers["groq"]._states), \
+            "a local budget miss must not put API keys on cooldown"
+        _reset_router_state()                                            # budget refills
+        breakers["gemini"].state, breakers["gemini"].opened_at = "open", breakers["gemini"]._now()
+        assert asyncio.run(router_mod.route(mk("cap-2"))).provider_used == "groq"
+    finally:
+        _reset_router_state()
+
+
+def test_pinned_tool_history_capacity_miss_does_not_bench_keys():
+    from app.router.bucket import tpm_buckets
+    _reset_router_state()
+
+    async def must_not_run(request, api_key=None):
+        raise AssertionError("no call expected")
+
+    router_mod.CLIENTS = {"groq": fake_client("groq_client", must_not_run),
+                          "gemini": fake_client("gemini_client", must_not_run)}
+    try:
+        pin_conversation("cap-pin", "groq")
+        tpm_buckets["groq"].tokens = 0
+        try:
+            asyncio.run(router_mod.route(_tool_history_request("cap-pin")))
+        except AllProvidersRateLimitedError:
+            pass
+        else:
+            raise AssertionError("expected AllProvidersRateLimitedError")
+        assert all(ks.available for ks in router_mod._key_managers["groq"]._states)
+    finally:
+        _reset_router_state()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

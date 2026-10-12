@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     # ── Provider limits (free tier). Set these to YOUR model's real limits. ──
     # Groq openai/gpt-oss-20b free tier: 30 RPM, 8K TPM (and 200K tokens/day,
     # which no per-minute bucket can protect you from — watch the Groq console).
+    # NOTE: the four limits below are PER API KEY (each key = its own account/quota).
     GROQ_RPM: int = 30
     GROQ_TPM: int = 8000
     # Gemini: confirm the real numbers for GEMINI_MODEL in AI Studio; TPM is a placeholder.

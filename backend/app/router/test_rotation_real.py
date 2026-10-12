@@ -38,10 +38,7 @@ def world(monkeypatch):
     calls = []
 
     def build(groq, gemini):
-        s = B.settings
-        for p, rpm, tpm in (("groq", s.GROQ_RPM, s.GROQ_TPM), ("gemini", s.GEMINI_RPM, s.GEMINI_TPM)):
-            B.rpm_buckets[p] = B.TokenBucket(rpm, rpm / 60)
-            B.tpm_buckets[p] = B.TokenBucket(tpm, tpm / 60)
+        B.reset_buckets()
         breakers["groq"], breakers["gemini"] = CircuitBreaker(), CircuitBreaker()
         B.conversation_provider_map.clear()
         monkeypatch.setattr(R, "tracker", _Tracker())
@@ -122,9 +119,9 @@ async def test_unused_reservation_is_refunded_when_keys_on_cooldown(world):
     world({"*": OK}, {"*": OK})
     for ks in R._key_managers["groq"]._states:
         ks.put_on_cooldown(100)
-    before = B.tpm_buckets["groq"].tokens
     await _go("groq")                       # served by gemini
-    assert B.tpm_buckets["groq"].tokens >= before - 5
+    for k in ("gA", "gB", "gC"):            # nothing may have been spent on the benched groq keys
+        assert B.buckets_for("groq", k)[1].tokens >= B.per_key_limits("groq")[1] - 5
 
 
 @pytest.mark.asyncio

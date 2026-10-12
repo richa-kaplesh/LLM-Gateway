@@ -46,74 +46,97 @@ class TokenBucket:
         return max(0.0, deficit / self.refill_rate)
 
 
-# RPM buckets — requests per minute, from each provider's free-tier limit (config.py)
-rpm_buckets = {
-    "groq": TokenBucket(capacity=settings.GROQ_RPM, refill_rate=settings.GROQ_RPM / 60),
-    "gemini": TokenBucket(capacity=settings.GEMINI_RPM, refill_rate=settings.GEMINI_RPM / 60),
-}
-
-# TPM buckets — input + output tokens per minute (config.py)
-tpm_buckets = {
-    "groq": TokenBucket(capacity=settings.GROQ_TPM, refill_rate=settings.GROQ_TPM / 60),
-    "gemini": TokenBucket(capacity=settings.GEMINI_TPM, refill_rate=settings.GEMINI_TPM / 60),
-}
+# ── Per-key buckets ─────────────────────────────────────────────────────────
+# Providers meter each API key's account separately, so every key gets its own RPM
+# and TPM bucket. A provider's capacity is the sum over its keys.
+# GROQ_RPM / GROQ_TPM / GEMINI_RPM / GEMINI_TPM in config.py are PER-KEY limits.
+_key_buckets: dict[tuple[str, str], tuple[TokenBucket, TokenBucket]] = {}
 
 
-def reserve_capacity(p: str, estimated_tokens: int) -> tuple[bool, float | None]:
-    """Atomically check + spend RPM and TPM for provider p.
-    Returns (True, 0.0) on success, else (False, seconds_to_wait or None if it can never fit).
-    can_consume/consume are split so a failed TPM check never spends RPM."""
-    rpm, tpm = rpm_buckets[p], tpm_buckets[p]
+def per_key_limits(p: str) -> tuple[int, int]:
+    """(rpm, tpm) limit of ONE key on provider p."""
+    if p == "groq":
+        return settings.GROQ_RPM, settings.GROQ_TPM
+    return settings.GEMINI_RPM, settings.GEMINI_TPM
+
+
+def buckets_for(p: str, api_key: str) -> tuple[TokenBucket, TokenBucket]:
+    pair = _key_buckets.get((p, api_key))
+    if pair is None:
+        rpm, tpm = per_key_limits(p)
+        pair = (TokenBucket(rpm, rpm / 60), TokenBucket(tpm, tpm / 60))
+        _key_buckets[(p, api_key)] = pair
+    return pair
+
+
+def reset_buckets() -> None:
+    _key_buckets.clear()
+
+
+def max_request_tokens() -> int:
+    """Largest request any single key could ever serve (TPM bucket capacity)."""
+    return max(per_key_limits("groq")[1], per_key_limits("gemini")[1])
+
+
+def key_fits(p: str, api_key: str, estimated_tokens: int) -> bool:
+    """Peek only: would this key's RPM and TPM allow the request right now?"""
+    rpm, tpm = buckets_for(p, api_key)
+    return rpm.can_consume() and tpm.can_consume(estimated_tokens)
+
+
+def key_wait(p: str, api_key: str, estimated_tokens: int) -> float | None:
+    """Seconds until this key's buckets fit the request. None = can never fit."""
+    rpm, tpm = buckets_for(p, api_key)
+    waits = [rpm.seconds_until(1), tpm.seconds_until(estimated_tokens)]
+    if None in waits:
+        return None
+    return max(waits)
+
+
+def reserve_capacity(p: str, estimated_tokens: int, api_key: str) -> tuple[bool, float | None]:
+    """Check + spend RPM and TPM on ONE key. Returns (True, 0.0) on success, else
+    (False, seconds_to_wait or None if it can never fit). can_consume/consume are
+    split so a failed TPM check never spends RPM."""
+    rpm, tpm = buckets_for(p, api_key)
     if estimated_tokens > tpm.capacity:
         return False, None
     if rpm.can_consume() and tpm.can_consume(estimated_tokens):
         rpm.consume()
         tpm.consume(estimated_tokens)
         return True, 0.0
-    waits = [rpm.seconds_until(1), tpm.seconds_until(estimated_tokens)]
-    return False, max(w for w in waits if w is not None)
+    return False, key_wait(p, api_key, estimated_tokens)
 
 
-def release_capacity(p: str, estimated_tokens: int) -> None:
+def release_capacity(p: str, estimated_tokens: int, api_key: str) -> None:
     """Refund a reservation for a request that never consumed provider quota
     (circuit open, invalid request, 429, cancelled before completion)."""
-    rpm_buckets[p].refund(1)
-    tpm_buckets[p].refund(estimated_tokens)
+    rpm, tpm = buckets_for(p, api_key)
+    rpm.refund(1)
+    tpm.refund(estimated_tokens)
 
 
-def capacity_retry_after(estimated_tokens: int, providers=("groq", "gemini")) -> float | None:
-    """Earliest time any provider could fit this request, for the Retry-After header."""
-    waits = []
-    for p in providers:
-        w = [rpm_buckets[p].seconds_until(1), tpm_buckets[p].seconds_until(estimated_tokens)]
-        if None not in w:
-            waits.append(max(w))
-    return min(waits) if waits else None
-
-
-def select_provider(estimated_tokens: int, exclude: tuple[str, ...] = ()):
-    """Picks a provider by weighted random order, then reserves RPM+TPM capacity.
-    Does NOT check the circuit breaker — that happens exactly once, in
-    router.py's _attempt_provider(), so a request isn't blocked by a probe it
-    itself just triggered (see: double allow_request() bug, found before shipping)."""
-    total = GROQ_WEIGHT + GEMINI_WEIGHT
+def select_provider(estimated_tokens: int, fits, exclude: tuple[str, ...] = (), weights: dict | None = None):
+    """Weighted random provider pick among those where fits(p) is True (some key has
+    capacity). Peek only: nothing is spent here; the RPM/TPM reservation happens per key
+    in router._attempt_provider. Does NOT check the circuit breaker (that happens exactly
+    once, in _attempt_provider, so a request isn't blocked by a probe it itself triggered)."""
+    w = weights or {"groq": GROQ_WEIGHT, "gemini": GEMINI_WEIGHT}
+    total = w["groq"] + w["gemini"]
     roll = random.uniform(0, total)
-    first, second = ("groq", "gemini") if roll < GROQ_WEIGHT else ("gemini", "groq")
+    first, second = ("groq", "gemini") if roll < w["groq"] else ("gemini", "groq")
 
     for p in (first, second):
         if p in exclude:
             continue
-        ok, _ = reserve_capacity(p, estimated_tokens)
-        if ok:
+        if fits(p):
             log.info("provider selected: %s (fresh weighted pick, preferred=%s%s)",
                      p, first, "" if p == first else ", preferred was out of capacity")
             return p
-        if estimated_tokens > tpm_buckets[p].capacity:
-            log.warning("skipping %s: prompt of %d tokens exceeds its TPM capacity of %d",
-                        p, estimated_tokens, tpm_buckets[p].capacity)
+        if estimated_tokens > per_key_limits(p)[1]:
+            log.warning("skipping %s: prompt of %d tokens exceeds its per-key TPM capacity of %d",
+                        p, estimated_tokens, per_key_limits(p)[1])
         else:
-            log.warning("token bucket empty: %s (rpm_tokens=%.1f, tpm_tokens=%.0f, needs %d tokens)",
-                        p, rpm_buckets[p].tokens, tpm_buckets[p].tokens, estimated_tokens)
+            log.warning("no key on %s has capacity for %d tokens right now", p, estimated_tokens)
     log.warning("no provider has capacity (tried %s then %s)", first, second)
     return None
 
@@ -128,29 +151,27 @@ def pin_conversation(conversation_id: str, provider: str) -> None:
         conversation_provider_map.pop(next(iter(conversation_provider_map)))
 
 
-def get_provider_for_conversation(conversation_id: str, estimated_tokens: int, must_stick: bool = False):
+def get_provider_for_conversation(conversation_id: str, estimated_tokens: int, fits,
+                                  must_stick: bool = False, weights: dict | None = None):
     """must_stick=True when the conversation already has tool-call history: that
     history can only be replayed safely to the provider that produced it
     (Gemini's thought_signature). Without tool history the request is effectively
     stateless, so a full sticky provider may be swapped for the other one."""
     sticky = conversation_provider_map.get(conversation_id)
     if sticky is not None:
-        ok, _ = reserve_capacity(sticky, estimated_tokens)
-        if ok:
+        if fits(sticky):
             log.info("provider selected: %s (sticky routing, conversation=%s)", sticky, conversation_id)
             return sticky
         if must_stick:
-            log.warning("rate limit: sticky provider %s has no capacity for conversation=%s "
-                        "(rpm_tokens=%.1f, tpm_tokens=%.0f, needs %d tokens); conversation has "
-                        "tool history so it cannot move; rejecting",
-                        sticky, conversation_id, rpm_buckets[sticky].tokens,
-                        tpm_buckets[sticky].tokens, estimated_tokens)
+            log.warning("rate limit: no key on sticky provider %s has capacity for conversation=%s "
+                        "(needs %d tokens); conversation has tool history so it cannot move; rejecting",
+                        sticky, conversation_id, estimated_tokens)
             return None
         log.info("sticky provider %s is full for conversation=%s and it has no tool history; re-picking",
                  sticky, conversation_id)
-        provider = select_provider(estimated_tokens, exclude=(sticky,))
+        provider = select_provider(estimated_tokens, fits, exclude=(sticky,), weights=weights)
     else:
-        provider = select_provider(estimated_tokens)
+        provider = select_provider(estimated_tokens, fits, weights=weights)
 
     if provider is not None:
         pin_conversation(conversation_id, provider)

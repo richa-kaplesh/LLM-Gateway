@@ -29,7 +29,7 @@ from app.cache.cache import get_cache_for
 from app.models.schemas import GatewayRequest, GatewayResponse
 from app.router.bucket import (
     get_provider_for_conversation, pin_conversation, reserve_capacity,
-    release_capacity, capacity_retry_after, tpm_buckets,
+    release_capacity, key_fits, key_wait, max_request_tokens, per_key_limits,
 )
 from app.tracker.tracker import tracker
 from app.router.circuit_breaker import breakers
@@ -59,6 +59,30 @@ _key_managers: dict[str, KeyManager] = {
 }
 
 DB_TIMEOUT_SECONDS = 2.0   # the database must never be able to stall or fail a request
+
+
+def _fits(p: str, tokens: int):
+    """Predicate for KeyManager.next_available: skip keys whose own bucket is dry."""
+    return lambda ks: key_fits(p, ks.key, tokens)
+
+
+def _provider_fits(p: str, tokens: int) -> bool:
+    return any(key_fits(p, ks.key, tokens) for ks in _key_managers[p].keys())
+
+
+def _provider_wait(p: str, tokens: int) -> float | None:
+    """Seconds until some key on p is both off cooldown and has bucket room. None = never."""
+    waits = []
+    for ks in _key_managers[p].keys():
+        w = key_wait(p, ks.key, tokens)
+        if w is not None:
+            waits.append(max(w, ks.cooldown_remaining))
+    return min(waits) if waits else None
+
+
+def _weights() -> dict:
+    """Provider weights follow real capacity: per-key RPM x number of keys."""
+    return {p: max(1, per_key_limits(p)[0] * _key_managers[p].key_count()) for p in ("groq", "gemini")}
 
 
 def estimate_tokens(messages: list[dict]) -> int:
@@ -111,17 +135,16 @@ async def _call_with_retry(client_module, request, api_key: str, attempts=3, del
 async def _attempt_provider(p: str, request: GatewayRequest, estimated_tokens: int,
                             reserve: bool, api_key: str) -> GatewayResponse:
     """One provider + one key, with breaker + capacity bookkeeping.
-    reserve=False when capacity was already spent by provider selection (primary);
-    reserve=True for the fallback, which previously bypassed the limiter entirely."""
+    Capacity is per KEY: reserve=True spends this key's own RPM/TPM bucket."""
     if reserve:
-        ok, wait = reserve_capacity(p, estimated_tokens)
+        ok, wait = reserve_capacity(p, estimated_tokens, api_key)
         if not ok:
             raise ProviderRateLimitedError(f"{p} has no capacity right now", retry_after=wait)
 
     breaker = breakers[p]
     state_before = breaker.state
     if not breaker.allow_request():
-        release_capacity(p, estimated_tokens)         # nothing was sent, give it back
+        release_capacity(p, estimated_tokens, api_key)         # nothing was sent, give it back
         log.warning("circuit %s for %s, skipping it", breaker.state, p)
         raise CircuitOpenError(f"{p} circuit is {breaker.state}, skipping", retry_after=breaker.retry_after())
 
@@ -138,30 +161,30 @@ async def _attempt_provider(p: str, request: GatewayRequest, estimated_tokens: i
         return resp
     except InvalidRequestError as e:
         breaker.record_inconclusive()
-        release_capacity(p, estimated_tokens)
+        release_capacity(p, estimated_tokens, api_key)
         log.info("provider %s rejected the request as invalid: %s", p, e)
         raise
     except ProviderRateLimitedError as e:
         # alive but busy: not a failure, and NOT a provider-wide pause. The router puts
         # only THIS key on cooldown so the provider's other keys can still be tried.
         breaker.record_reachable()
-        release_capacity(p, estimated_tokens)
+        release_capacity(p, estimated_tokens, api_key)
         log.warning("provider %s answered 429 (retry_after=%s): %s", p, e.retry_after, e)
         raise
     except ProviderKeyError as e:
         # this KEY was rejected; the provider itself is fine (don't count a breaker failure)
         breaker.record_reachable()
-        release_capacity(p, estimated_tokens)
+        release_capacity(p, estimated_tokens, api_key)
         log.error("provider %s rejected an API key: %s", p, e)
         raise
     except asyncio.CancelledError:
         breaker.record_inconclusive()                 # a cancelled probe must not wedge half_open
-        release_capacity(p, estimated_tokens)
+        release_capacity(p, estimated_tokens, api_key)
         raise
     except Exception as e:
         breaker.record_failure()
         if isinstance(e, ProviderConnectionError):
-            release_capacity(p, estimated_tokens)     # request most likely never completed
+            release_capacity(p, estimated_tokens, api_key)     # request most likely never completed
         log.warning("provider %s failed (breaker=%s, consecutive_failures=%d): %s",
                     p, breaker.state, breaker.consecutive_failures, e)
         raise
@@ -222,19 +245,16 @@ async def _route_with_key_rotation(
     tried_fallback_key: str | None = None
 
     # First attempt: primary provider (capacity already reserved in route())
-    ks = km_primary.next_available()
+    ks = km_primary.next_available(fits=_fits(primary, estimated_tokens))
     if ks is None:
-        release_capacity(primary, estimated_tokens)   # reserved in route() but never used
-        log.warning("all %s keys are on cooldown at start", primary)
-    first_attempt = True
+        log.warning("no %s key is available (cooldown or per-key limit) at start", primary)
     while ks is not None:
         tried_primary_key = ks.key
         log.info("routing request: provider=%s key=%s", primary, ks.masked)
         try:
-            # only the very first attempt uses the reservation made in route();
-            # later keys re-reserve (the earlier reservation was released on failure)
+            # every attempt reserves capacity on the key it is about to use
             resp = await _attempt_provider(primary, request, estimated_tokens,
-                                           reserve=not first_attempt, api_key=ks.key)
+                                           reserve=True, api_key=ks.key)
             km_primary.record_success(ks)
             return resp
         except InvalidRequestError:
@@ -243,8 +263,7 @@ async def _route_with_key_rotation(
             km_primary.record_auth_failed(ks)
             key_errors.setdefault(primary, []).append(e)
             log.warning("rotation: %s key %s rejected; trying this provider's next key", primary, ks.masked)
-            first_attempt = False
-            ks = km_primary.next_available(skip_key=ks.key)
+            ks = km_primary.next_available(skip_key=ks.key, fits=_fits(primary, estimated_tokens))
             continue
         except ProviderRateLimitedError as e:
             km_primary.record_rate_limited(ks, e.retry_after)
@@ -275,11 +294,11 @@ async def _route_with_key_rotation(
         km = km_fallback if turn == fallback else km_primary
         skip = tried_fallback_key if turn == fallback else tried_primary_key
 
-        ks = km.next_available(skip_key=skip)
+        ks = km.next_available(skip_key=skip, fits=_fits(turn, estimated_tokens))
         if ks is None:
             log.info("no available keys left on %s, switching side", turn)
             turn = _other_provider(turn)
-            if _all_sides_dry(km_primary, km_fallback, circuit_open):
+            if _all_sides_dry(km_primary, km_fallback, circuit_open, estimated_tokens):
                 break
             continue
 
@@ -334,8 +353,8 @@ async def _route_with_key_rotation(
             retry_after=min(hints) if hints else None,
         )
 
-    candidates = [km.soonest_retry_seconds()
-                  for name, km in ((primary, km_primary), (fallback, km_fallback))
+    candidates = [_provider_wait(name, estimated_tokens)
+                  for name in (primary, fallback)
                   if name not in circuit_open]
     candidates += [e.retry_after for e in circuit_open.values()]
     soonest = min((t for t in candidates if t is not None), default=None)
@@ -351,10 +370,13 @@ async def _route_with_key_rotation(
     )
 
 
-def _all_sides_dry(km_primary: KeyManager, km_fallback: KeyManager, circuit_open: dict) -> bool:
-    """True when no side has a usable key left (cooled down, or its breaker is open)."""
+def _all_sides_dry(km_primary: KeyManager, km_fallback: KeyManager, circuit_open: dict,
+                   estimated_tokens: int = 0) -> bool:
+    """True when no side has a usable key left (cooled down, over its own limit, or breaker open)."""
     for name, km in ((km_primary.provider, km_primary), (km_fallback.provider, km_fallback)):
-        if name not in circuit_open and not km.all_on_cooldown():
+        if name in circuit_open:
+            continue
+        if any(ks.available and key_fits(name, ks.key, estimated_tokens) for ks in km.keys()):
             return False
     return True
 
@@ -371,16 +393,14 @@ async def _route_pinned(provider: str, request: GatewayRequest, estimated_tokens
     last_rl: ProviderRateLimitedError | None = None
     key_errors: list[ProviderKeyError] = []
 
-    ks = km.next_available()
+    ks = km.next_available(fits=_fits(provider, estimated_tokens))
     if ks is None:
-        release_capacity(provider, estimated_tokens)      # reserved in route() but never used
-        log.warning("all %s keys are on cooldown at start", provider)
-    first_attempt = True
+        log.warning("no %s key is available (cooldown or per-key limit) at start", provider)
     while ks is not None:
         log.info("routing request (pinned, tool history): provider=%s key=%s", provider, ks.masked)
         try:
             resp = await _attempt_provider(provider, request, estimated_tokens,
-                                           reserve=not first_attempt, api_key=ks.key)
+                                           reserve=True, api_key=ks.key)
             km.record_success(ks)
             return resp
         except InvalidRequestError:
@@ -401,8 +421,7 @@ async def _route_pinned(provider: str, request: GatewayRequest, estimated_tokens
                 f"(it has tool-call history): {e}", retry_after=None)
         except Exception as e:
             raise ProviderDownError(provider, e) from e
-        first_attempt = False
-        ks = km.next_available(skip_key=ks.key)
+        ks = km.next_available(skip_key=ks.key, fits=_fits(provider, estimated_tokens))
 
     if last_rl is None and key_errors:
         raise AllProvidersUnavailableError(
@@ -410,7 +429,7 @@ async def _route_pinned(provider: str, request: GatewayRequest, estimated_tokens
     raise AllProvidersRateLimitedError(
         f"All {provider} keys are rate-limited and this conversation cannot move to another "
         f"provider (it has tool-call history). {last_rl or ''}".strip(),
-        retry_after=km.soonest_retry_seconds(),
+        retry_after=_provider_wait(provider, estimated_tokens),
     )
 
 
@@ -435,18 +454,19 @@ async def route(request: GatewayRequest) -> GatewayResponse:
                 return lookup.hit
 
     estimated_tokens = estimate_request_tokens(request)
-    max_capacity = max(tpm_buckets["groq"].capacity, tpm_buckets["gemini"].capacity)
-    if estimated_tokens > max_capacity:
+    if estimated_tokens > max_request_tokens():
         raise TooLongError(f"Prompt is too long ({estimated_tokens} tokens) for any configured provider")
 
     provider = get_provider_for_conversation(
         request.conversation_id, estimated_tokens,
-        must_stick=tool_history,
+        fits=lambda p: _provider_fits(p, estimated_tokens),
+        must_stick=tool_history, weights=_weights(),
     )
     if provider is None:
         raise AllProvidersRateLimitedError(
             "Both providers are rate-limited right now. Try again shortly.",
-            retry_after=capacity_retry_after(estimated_tokens),
+            retry_after=min((w for w in (_provider_wait(p, estimated_tokens) for p in ("groq", "gemini"))
+                             if w is not None), default=None),
         )
 
     was_fallback = False

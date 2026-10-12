@@ -85,11 +85,16 @@ class KeyManager:
 
     # ── Public interface ────────────────────────────────────────────────────
 
-    def next_available(self, skip_key: str | None = None) -> KeyState | None:
+    def keys(self) -> list[KeyState]:
+        return list(self._states)
+
+    def next_available(self, skip_key: str | None = None, fits=None) -> KeyState | None:
         """Return the next KeyState that is not on cooldown and is not ``skip_key``.
 
         Iterates in round-robin order starting from the key after the last used
-        one.  Returns None if every key is either on cooldown or is skip_key.
+        one.  ``fits(ks)`` (optional) skips keys whose own RPM/TPM bucket cannot take the
+        request right now, without putting them on cooldown.  Returns None if every key is
+        on cooldown, is skip_key, or doesn't fit.
         """
         n = len(self._states)
         start = (self._last_index + 1) % n
@@ -98,7 +103,7 @@ class KeyManager:
             ks = self._states[idx]
             if skip_key and ks.key == skip_key:
                 continue
-            if ks.available:
+            if ks.available and (fits is None or fits(ks)):
                 self._last_index = idx
                 return ks
         return None

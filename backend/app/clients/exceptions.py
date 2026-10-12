@@ -45,6 +45,14 @@ class ProviderRateLimitedError(Exception):
         self.retry_after = retry_after
 
 
+class LocalCapacityError(ProviderRateLimitedError):
+    """OUR OWN RPM/TPM budget for this provider is spent. The provider never said 429 and no
+    key is at fault, so keys must NOT be put on cooldown. The budget is per provider, not per
+    key, so trying another key of the same provider cannot help either. retry_after is how long
+    until the local bucket refills enough (None = this request can never fit the budget)."""
+    pass
+
+
 class CircuitOpenError(Exception):
     """We skipped a provider without calling it because its breaker is open
     (or a half-open probe is already in flight)."""
