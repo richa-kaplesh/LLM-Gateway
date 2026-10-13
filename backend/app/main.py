@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.models.schemas import GatewayRequest, GatewayResponse, CostSummary, HealthCheck
 from app.router.router import route, estimate_request_tokens
 from app.tracker.tracker import tracker
+from app.tracker import metrics as metrics_store
+from pydantic import BaseModel
 from app.core.config import get_settings
 from app.core.db import init_pool, close_pool
 from app.cache.cache import close_http
@@ -49,6 +51,10 @@ async def lifespan(app: FastAPI):
                  _name, _km.key_count(), [k["key"] for k in _km.status_summary()],
                  _rpm, _tpm, _rpm * _km.key_count(), _tpm * _km.key_count())
     await init_pool()
+    try:
+        await metrics_store.ensure_tables()
+    except Exception as e:   # best-effort: the gateway must still serve requests
+        log.warning("could not ensure metric_snapshots table: %s: %s", type(e).__name__, e)
     yield
     await close_http()
     await close_pool()
@@ -214,3 +220,38 @@ async def breaker_status():
             "keys": _key_managers[name].status_summary(),
         }
     return result
+
+
+# ── Baseline metrics (computed from request_logs / breaker_events) ─────────────
+
+def _parse_window(since: str | None, until: str | None):
+    try:
+        return metrics_store.parse_ts(since), metrics_store.parse_ts(until)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="since/until must be ISO 8601 timestamps")
+
+
+@app.get("/metrics/summary")
+async def metrics_summary(since: str | None = None, until: str | None = None):
+    s, u = _parse_window(since, until)
+    return await metrics_store.get_metrics_summary(s, u)
+
+
+class SnapshotRequest(BaseModel):
+    label: str
+    since: str | None = None
+    until: str | None = None
+
+
+@app.get("/metrics/snapshots")
+async def metrics_snapshots():
+    return await metrics_store.list_snapshots()
+
+
+@app.post("/metrics/snapshots")
+async def metrics_save_snapshot(body: SnapshotRequest):
+    label = body.label.strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="label is required")
+    s, u = _parse_window(body.since, body.until)
+    return await metrics_store.save_snapshot(label[:120], s, u)

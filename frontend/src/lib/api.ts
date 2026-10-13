@@ -265,6 +265,16 @@ export interface MetricsSummary {
   tokens: {
     avg_estimated: number | null
     p95_estimated: number | null
+    /** real usage reported by the providers (provider calls only) */
+    rows_with_usage?: number
+    avg_input?: number | null
+    avg_output?: number | null
+    avg_thought?: number | null
+    total_input?: number | null
+    total_output?: number | null
+    total_cached?: number | null
+    /** estimated / actual (input + output): 1.0 is perfect, above 1 means over-estimating */
+    estimate_to_actual_ratio?: number | null
   }
   legacy: {
     hit_rows_with_zero_latency: number

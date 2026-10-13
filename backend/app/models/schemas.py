@@ -40,6 +40,12 @@ class GatewayResponse(BaseModel):
     was_fallback: bool = False
     embed_latency_ms: float = 0.0   # part of latency_ms spent on the cache's embedding call
     embed_cost_usd: float = 0.0     # part of cost_usd spent on the cache's embedding call
+    # Real token counts as reported by the provider (None on a cache hit: no provider call)
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None    # includes thinking tokens, which providers bill as output
+    thought_tokens: Optional[int] = None   # the thinking part of output_tokens (Gemini)
+    cached_tokens: Optional[int] = None    # prompt tokens served from the provider's prompt cache
+    price_known: bool = True               # False when the model has no entry in the rate card
 
     @field_serializer("tool_calls")
     def _serialize_tool_calls(self, value: Optional[list[dict]]):

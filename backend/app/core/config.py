@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     GEMINI_INPUT_COST_PER_MILLION: float = 0.075
     GEMINI_OUTPUT_COST_PER_MILLION: float = 0.30
 
+    # Price of a prompt token served from the provider's prompt cache. Leave at -1 = no
+    # discount known (cached tokens are then billed at the normal input price).
+    GROQ_CACHED_INPUT_COST_PER_MILLION: float = -1.0
+    GEMINI_CACHED_INPUT_COST_PER_MILLION: float = -1.0
+
     # Set from Jina's pricing page; 0.0 means embedding cost is NOT being counted
     JINA_COST_PER_MILLION: float = 0.02
 

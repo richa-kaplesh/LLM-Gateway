@@ -1,0 +1,40 @@
+-- Reconstructed from the INSERTs/SELECTs in app/tracker/tracker.py and app/tracker/metrics.py.
+-- Every statement is IF NOT EXISTS, so running it against your existing Neon database
+-- changes nothing that already exists. Run it in a fresh database to get a working gateway.
+
+CREATE TABLE IF NOT EXISTS request_logs (
+    id               BIGSERIAL PRIMARY KEY,
+    timestamp        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    user_id          TEXT,
+    conversation_id  TEXT,
+    provider_used    TEXT,
+    model_used       TEXT,
+    was_fallback     BOOLEAN NOT NULL DEFAULT FALSE,
+    cost_usd         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    latency_ms       DOUBLE PRECISION,
+    estimated_tokens INTEGER,
+    cache_hit        BOOLEAN NOT NULL DEFAULT FALSE,
+    cache_scope      TEXT,
+    status           TEXT NOT NULL DEFAULT 'success',
+    error_type       TEXT,
+    embed_latency_ms DOUBLE PRECISION,
+    embed_cost_usd   DOUBLE PRECISION
+);
+CREATE INDEX IF NOT EXISTS request_logs_timestamp_idx ON request_logs (timestamp);
+
+CREATE TABLE IF NOT EXISTS breaker_events (
+    id         BIGSERIAL PRIMARY KEY,
+    timestamp  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    provider   TEXT NOT NULL,
+    old_state  TEXT NOT NULL,
+    new_state  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS metric_snapshots (
+    id           BIGSERIAL PRIMARY KEY,
+    label        TEXT NOT NULL,
+    taken_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    window_since TIMESTAMPTZ,
+    window_until TIMESTAMPTZ,
+    metrics      JSONB NOT NULL
+);

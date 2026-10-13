@@ -1,6 +1,7 @@
 import time
 import groq
 from app.core.config import get_settings
+from app.core.pricing import price_usage
 from app.models.schemas import GatewayRequest, GatewayResponse
 from app.clients.exceptions import (
     ProviderUnavailableError, ProviderConnectionError, InvalidRequestError,
@@ -32,10 +33,18 @@ def _retry_after_seconds(e: Exception) -> float | None:
         return None
 
 
-def calculate_cost(prompt_tokens: int, completion_tokens: int) -> float:
-    input_cost = (prompt_tokens / 1_000_000) * settings.GROQ_INPUT_COST_PER_MILLION
-    output_cost = (completion_tokens / 1_000_000) * settings.GROQ_OUTPUT_COST_PER_MILLION
-    return input_cost + output_cost
+def calculate_cost(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> float:
+    return price_usage(settings.GROQ_MODEL, prompt_tokens, completion_tokens, cached_tokens)[0]
+
+
+def _usage(response) -> tuple[int, int, int]:
+    """(prompt, completion, cached) tokens as reported by Groq; completion already includes
+    any reasoning tokens. Missing fields count as 0 rather than crashing a good answer."""
+    u = getattr(response, "usage", None)
+    details = getattr(u, "prompt_tokens_details", None)
+    return (int(getattr(u, "prompt_tokens", 0) or 0),
+            int(getattr(u, "completion_tokens", 0) or 0),
+            int(getattr(details, "cached_tokens", 0) or 0))
 
 
 def normalize_tool_calls(tool_calls):
@@ -90,10 +99,8 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
         response = await client.chat.completions.create(**kwargs)
 
         latency_ms = (time.perf_counter() - start_time) * 1000
-        cost = calculate_cost(
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens
-        )
+        prompt_t, completion_t, cached_t = _usage(response)
+        cost, price_known = price_usage(settings.GROQ_MODEL, prompt_t, completion_t, cached_t)
 
         message = response.choices[0].message
         answer = message.content
@@ -108,7 +115,9 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
             provider_used="groq",
             cost_usd=cost,
             latency_ms=latency_ms,
-            cache_hit=False
+            cache_hit=False,
+            input_tokens=prompt_t, output_tokens=completion_t, cached_tokens=cached_t,
+            price_known=price_known,
         )
 
     except groq.RateLimitError as e:

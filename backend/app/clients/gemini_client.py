@@ -7,6 +7,7 @@ import asyncio
 from google import genai
 from google.genai import types
 from app.core.config import get_settings
+from app.core.pricing import price_usage
 from app.models.schemas import GatewayRequest, GatewayResponse
 from google.genai import errors as genai_errors
 from app.clients.exceptions import (
@@ -88,10 +89,21 @@ def _retry_after_seconds(e: Exception) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def calculate_cost(prompt_tokens: int, output_tokens: int) -> float:
-    input_cost = (prompt_tokens / 1_000_000) * settings.GEMINI_INPUT_COST_PER_MILLION
-    output_cost = (output_tokens / 1_000_000) * settings.GEMINI_OUTPUT_COST_PER_MILLION
-    return input_cost + output_cost
+def calculate_cost(prompt_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
+    return price_usage(settings.GEMINI_MODEL, prompt_tokens, output_tokens, cached_tokens)[0]
+
+
+def _usage(response) -> tuple[int, int, int, int]:
+    """(prompt, output, thoughts, cached) tokens from Gemini's usage_metadata.
+    Gemini reports thinking tokens separately from candidates_token_count, but bills them as
+    OUTPUT, so output = candidates + thoughts. (The old code left thoughts out, undercounting
+    cost on every thinking model.) Missing/None fields count as 0."""
+    u = getattr(response, "usage_metadata", None)
+    prompt = int(getattr(u, "prompt_token_count", 0) or 0)
+    candidates = int(getattr(u, "candidates_token_count", 0) or 0)
+    thoughts = int(getattr(u, "thoughts_token_count", 0) or 0)
+    cached = int(getattr(u, "cached_content_token_count", 0) or 0)
+    return prompt, candidates + thoughts, thoughts, cached
 
 
 
@@ -255,10 +267,8 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
 
         latency_ms = (time.perf_counter() - start_time) * 1000
 
-        cost = calculate_cost(
-            response.usage_metadata.prompt_token_count,
-            response.usage_metadata.candidates_token_count
-        )
+        prompt_t, output_t, thought_t, cached_t = _usage(response)
+        cost, price_known = price_usage(settings.GEMINI_MODEL, prompt_t, output_t, cached_t)
 
         has_calls = bool(response.function_calls)
         answer = None if has_calls else response.text
@@ -273,7 +283,9 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
             provider_used="gemini",
             cost_usd=cost,
             latency_ms=latency_ms,
-            cache_hit=False
+            cache_hit=False,
+            input_tokens=prompt_t, output_tokens=output_t, thought_tokens=thought_t,
+            cached_tokens=cached_t, price_known=price_known,
         )
 
     except InvalidRequestError:

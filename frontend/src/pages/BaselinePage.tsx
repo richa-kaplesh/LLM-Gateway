@@ -812,12 +812,43 @@ export function BaselinePage() {
               </div>
               <p className="text-xs text-stone-400 mt-4 flex items-center gap-1">
                 <Info className="w-3 h-3 shrink-0" />
-                "Est. saved" = hits x avg miss cost. It is an estimate, not a direct measurement.
+                "Est. saved" = cache hits x (avg miss cost - avg hit cost). It is an estimate, not a direct measurement.
               </p>
             </CardContent>
           </Card>
 
-          {/* 6. Token estimates (only if data exists) */}
+          {/* 6a. Real token usage reported by the providers */}
+          {(summary.tokens.rows_with_usage ?? 0) > 0 && (
+            <Card>
+              <CardHeader><CardTitle>Token usage (reported by providers)</CardTitle></CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  {[
+                    { label: 'Avg input',        value: fnum(summary.tokens.avg_input ?? null) },
+                    { label: 'Avg output',       value: fnum(summary.tokens.avg_output ?? null) },
+                    { label: 'Avg thinking',     value: fnum(summary.tokens.avg_thought ?? null) },
+                    { label: 'Estimate / actual', value: summary.tokens.estimate_to_actual_ratio == null ? 'not recorded' : summary.tokens.estimate_to_actual_ratio.toFixed(2) + 'x' },
+                  ].map(({ label, value }) => (
+                    <div key={label} className="flex flex-col rounded-lg border border-stone-100 bg-stone-50 px-4 py-3">
+                      <span className="text-[10px] font-semibold uppercase tracking-widest text-stone-400 mb-1">{label}</span>
+                      <span className="text-lg font-semibold text-stone-800 tabular-nums leading-tight">
+                        {value === 'not recorded' ? <NR /> : value}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-xs text-stone-400 mt-3">
+                  {(summary.tokens.rows_with_usage ?? 0).toLocaleString()} provider calls with real usage
+                  {summary.tokens.total_input != null && <> · {summary.tokens.total_input.toLocaleString()} input / {(summary.tokens.total_output ?? 0).toLocaleString()} output tokens in total</>}
+                  {(summary.tokens.total_cached ?? 0) > 0 && <> · {(summary.tokens.total_cached ?? 0).toLocaleString()} served from the provider's prompt cache</>}.
+                  Thinking tokens are billed as output. "Estimate / actual" compares the gateway's pre-call estimate
+                  (which includes a 512-token output allowance) with what the provider counted.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* 6b. Token estimates (only if data exists) */}
           {(summary.tokens.avg_estimated != null || summary.tokens.p95_estimated != null) && (
             <Card>
               <CardHeader><CardTitle>Token usage (estimated)</CardTitle></CardHeader>
