@@ -34,6 +34,8 @@ class GatewayResponse(BaseModel):
     finish_reason: Optional[str] = None
     model_used: str
     provider_used: str
+    deployment_id: Optional[str] = None
+    attempts: int = 1
     cost_usd: float
     latency_ms: float
     cache_hit: bool
@@ -66,5 +68,4 @@ class CostSummary(BaseModel):
 
 class HealthCheck(BaseModel):
     status: str
-    groq_available: bool
-    gemini_available: bool
+    deployments: list[str]

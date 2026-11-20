@@ -8,6 +8,7 @@ from google import genai
 from google.genai import types
 from app.core.config import get_settings
 from app.core.pricing import price_usage
+from app.models.deployment import Deployment
 from app.models.schemas import GatewayRequest, GatewayResponse
 from google.genai import errors as genai_errors
 from app.clients.exceptions import (
@@ -87,10 +88,6 @@ def _retry_after_seconds(e: Exception) -> float | None:
         pass
     m = re.search(r"retry in ([\d.]+)\s*s", str(e), re.IGNORECASE)
     return float(m.group(1)) if m else None
-
-
-def calculate_cost(prompt_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
-    return price_usage(settings.GEMINI_MODEL, prompt_tokens, output_tokens, cached_tokens)[0]
 
 
 def _usage(response) -> tuple[int, int, int, int]:
@@ -237,11 +234,8 @@ def convert_tools(tools: list[dict] | None):
 
 
 
-async def complete(request: GatewayRequest, api_key: str | None = None) -> GatewayResponse:
-    """Call Gemini.  Pass ``api_key`` to use a specific key; omit to fall back
-    to the single legacy key in settings (backward-compatible behaviour)."""
-    key = api_key or settings.GEMINI_API_KEY
-    client = _make_client(key)
+async def complete(request: GatewayRequest, deployment: Deployment) -> GatewayResponse:
+    client = _make_client(deployment.api_key.get_secret_value())
     try:
         start_time = time.perf_counter()
 
@@ -260,7 +254,7 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
         response = await client.aio.models.generate_content(
-            model=settings.GEMINI_MODEL,
+            model=deployment.model,
             contents=contents,
             config=config
         )
@@ -268,7 +262,7 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
         latency_ms = (time.perf_counter() - start_time) * 1000
 
         prompt_t, output_t, thought_t, cached_t = _usage(response)
-        cost, price_known = price_usage(settings.GEMINI_MODEL, prompt_t, output_t, cached_t)
+        cost = price_usage(deployment.price, prompt_t, output_t, cached_t)
 
         has_calls = bool(response.function_calls)
         answer = None if has_calls else response.text
@@ -279,13 +273,14 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
             content=answer,
             tool_calls=tool_calls,
             finish_reason=str(finish_reason) if finish_reason else None,
-            model_used=settings.GEMINI_MODEL,
-            provider_used="gemini",
+            model_used=deployment.model,
+            provider_used=deployment.provider,
+            deployment_id=deployment.id,
             cost_usd=cost,
             latency_ms=latency_ms,
             cache_hit=False,
             input_tokens=prompt_t, output_tokens=output_t, thought_tokens=thought_t,
-            cached_tokens=cached_t, price_known=price_known,
+            cached_tokens=cached_t,
         )
 
     except InvalidRequestError:
@@ -300,10 +295,10 @@ async def complete(request: GatewayRequest, api_key: str | None = None) -> Gatew
             raise ProviderRateLimitedError(f"Gemini quota exceeded: {str(e)[:300]}", retry_after=retry_after)
         if code in (401, 403, 404) or _is_bad_key(e):
             # Bad/expired key, no access to this model for this key's project, or a wrong
-            # GEMINI_MODEL. Treated per KEY: the router benches this key and tries the next.
+            # model name. Treated per KEY: the router benches this key and tries the next.
             # If every key fails this way the final error says so (and names the cause).
-            log.error("Gemini key unusable (HTTP %s) with GEMINI_MODEL=%s: %s",
-                      code, settings.GEMINI_MODEL, str(e)[:300])
+            log.error("Gemini key unusable (HTTP %s) with model=%s: %s",
+                      code, deployment.model, str(e)[:300])
             raise ProviderKeyError(f"Gemini key unusable (HTTP {code}): {str(e)[:300]}")
         if code == 408:
             # Timeout: the network timed out, not a server problem. The other

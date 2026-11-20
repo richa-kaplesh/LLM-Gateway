@@ -11,9 +11,11 @@ Conventions
 """
 import json
 import logging
+from collections import Counter, defaultdict
 from datetime import datetime
 
 from app.core.db import get_pool
+from app.core.registry import get_deployments
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +45,31 @@ def _lat(row) -> dict:
             "p95": _r(row["p95"]), "p99": _r(row["p99"])}
 
 
+ATTEMPT_SCHEMA = (
+    "ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS request_id TEXT",
+    "ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS deployment_id TEXT",
+    "ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS attempts SMALLINT",
+    "ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS capacity_existed BOOLEAN",
+    "CREATE INDEX IF NOT EXISTS request_logs_request_id_idx ON request_logs (request_id)",
+    "CREATE INDEX IF NOT EXISTS request_logs_deployment_time_idx ON request_logs (deployment_id, timestamp)",
+    """CREATE TABLE IF NOT EXISTS attempt_logs (
+           id BIGSERIAL PRIMARY KEY,
+           timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
+           request_id TEXT NOT NULL,
+           attempt_no SMALLINT NOT NULL,
+           deployment_id TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           model TEXT NOT NULL,
+           outcome TEXT NOT NULL,
+           error_type TEXT,
+           latency_ms DOUBLE PRECISION,
+           retry_after_s DOUBLE PRECISION)""",
+    "CREATE INDEX IF NOT EXISTS attempt_logs_timestamp_idx ON attempt_logs (timestamp)",
+    "CREATE INDEX IF NOT EXISTS attempt_logs_deployment_time_idx ON attempt_logs (deployment_id, timestamp)",
+    "CREATE INDEX IF NOT EXISTS attempt_logs_request_id_idx ON attempt_logs (request_id)",
+)
+
+
 async def ensure_tables() -> None:
     """Create the snapshots table, and add the token columns to request_logs (idempotent).
     Only after the columns exist does the tracker start writing to them."""
@@ -55,6 +82,13 @@ async def ensure_tables() -> None:
     except Exception as ex:
         log.warning("could not add token columns to request_logs; token usage will not be "
                     "recorded until this succeeds: %s: %s", type(ex).__name__, ex)
+    try:
+        for statement in ATTEMPT_SCHEMA:
+            await pool.execute(statement)
+        tracker.attempt_columns = True
+    except Exception as ex:
+        log.warning("could not add deployment/attempt logging schema; per-deployment history "
+                    "will not be recorded until this succeeds: %s: %s", type(ex).__name__, ex)
     await pool.execute(
         """CREATE TABLE IF NOT EXISTS metric_snapshots (
                id BIGSERIAL PRIMARY KEY, label TEXT NOT NULL,
@@ -70,6 +104,127 @@ async def _breaker_time_column(pool) -> str | None:
         if c in cols:
             return c
     return None
+
+
+LOCAL_REFUSALS = ("local_capacity", "breaker_open")
+MIN_POOL_CALLS = 20
+
+
+async def _deployment_metrics(pool, W: str, args: tuple) -> dict | None:
+    try:
+        attempt_rows = await pool.fetch(
+            f"""SELECT deployment_id, min(provider) AS provider, min(model) AS model,
+                       count(*) AS attempts,
+                       count(*) FILTER (WHERE outcome NOT IN ('local_capacity', 'breaker_open')) AS calls,
+                       count(*) FILTER (WHERE outcome = 'success') AS successes,
+                       max(timestamp) AS last_attempt_at,
+                       percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)
+                           FILTER (WHERE outcome = 'success') AS p50,
+                       percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
+                           FILTER (WHERE outcome = 'success') AS p95
+                FROM attempt_logs WHERE {W} GROUP BY deployment_id""", *args)
+        outcome_rows = await pool.fetch(
+            f"""SELECT deployment_id, outcome, count(*) AS count
+                FROM attempt_logs WHERE {W} GROUP BY 1, 2""", *args)
+        token_rows = await pool.fetch(
+            f"""SELECT deployment_id, sum(input_tokens) AS input, sum(output_tokens) AS output,
+                       avg(input_tokens) AS avg_input, avg(output_tokens) AS avg_output
+                FROM request_logs
+                WHERE {W} AND status = 'success' AND NOT cache_hit AND deployment_id IS NOT NULL
+                GROUP BY 1""", *args)
+        routing = await pool.fetchrow(
+            f"""SELECT count(*) FILTER (WHERE status = 'error' AND capacity_existed IS NOT NULL) AS gave_up,
+                       count(*) FILTER (WHERE status = 'error' AND capacity_existed) AS wasted,
+                       count(*) FILTER (WHERE attempts > 1) AS multi_attempt,
+                       count(*) FILTER (WHERE attempts IS NOT NULL) AS with_attempts,
+                       avg(attempts) AS avg_attempts
+                FROM request_logs WHERE {W}""", *args)
+    except Exception as ex:
+        log.warning("deployment metrics unavailable: %s: %s", type(ex).__name__, ex)
+        return None
+
+    seen = {r["deployment_id"]: r for r in attempt_rows}
+    outcomes: dict[str, dict[str, int]] = defaultdict(dict)
+    for r in outcome_rows:
+        outcomes[r["deployment_id"]][r["outcome"]] = r["count"]
+    tokens = {r["deployment_id"]: r for r in token_rows}
+    registry = {d.id: d for d in get_deployments()}
+    ids = list(registry) + sorted(i for i in seen if i not in registry)
+
+    def group_of(dep_id: str) -> tuple[str, str]:
+        if dep_id in registry:
+            return registry[dep_id].model_group
+        return seen[dep_id]["provider"], seen[dep_id]["model"]
+
+    pool_attempts: Counter = Counter()
+    pool_calls: Counter = Counter()
+    for dep_id in ids:
+        row = seen.get(dep_id)
+        pool_attempts[group_of(dep_id)] += row["attempts"] if row else 0
+        pool_calls[group_of(dep_id)] += row["calls"] if row else 0
+
+    deployments = []
+    for dep_id in ids:
+        dep, row, tok = registry.get(dep_id), seen.get(dep_id), tokens.get(dep_id)
+        group = group_of(dep_id)
+        attempts = row["attempts"] if row else 0
+        calls = row["calls"] if row else 0
+        if dep is None:
+            state = "not_live"
+        elif attempts == 0 and pool_attempts[group] > 0:
+            state = "idle"
+        elif attempts == 0:
+            state = "no_traffic"
+        else:
+            state = "active"
+        errors = {k: v for k, v in outcomes.get(dep_id, {}).items() if k != "success"}
+        deployments.append({
+            "deployment_id": dep_id, "provider": group[0], "model": group[1], "state": state,
+            "attempts": attempts, "provider_calls": calls,
+            "successes": row["successes"] if row else 0,
+            "local_refusals": sum(errors.get(k, 0) for k in LOCAL_REFUSALS),
+            "share_of_pool_pct": _pct(calls, pool_calls[group]),
+            "errors": errors,
+            "error_rate_pct": _pct(calls - (row["successes"] if row else 0), calls),
+            "provider_429s": errors.get("rate_limited", 0),
+            "latency_ms": {"p50": _r(row["p50"]) if row else None, "p95": _r(row["p95"]) if row else None},
+            "tokens": {
+                "total_input": int(tok["input"]) if tok and tok["input"] is not None else None,
+                "total_output": int(tok["output"]) if tok and tok["output"] is not None else None,
+                "avg_input": _r(tok["avg_input"], 0) if tok else None,
+                "avg_output": _r(tok["avg_output"], 0) if tok else None,
+            },
+            "last_attempt_at": row["last_attempt_at"].isoformat() if row else None,
+        })
+
+    pools = []
+    for group in dict.fromkeys(group_of(i) for i in ids):
+        members = [d for d in deployments if (d["provider"], d["model"]) == group]
+        enabled = [d for d in members if d["state"] in ("active", "idle", "no_traffic")]
+        shares = [d["share_of_pool_pct"] or 0.0 for d in enabled]
+        balanced = len(enabled) >= 2 and pool_calls[group] >= MIN_POOL_CALLS
+        pools.append({
+            "provider": group[0], "model": group[1],
+            "deployments": [d["deployment_id"] for d in members],
+            "enabled": len(enabled), "provider_calls": pool_calls[group],
+            "fair_share_pct": _r(100 / len(enabled)) if enabled else None,
+            "imbalance_pct": _r(max(shares) - min(shares)) if balanced else None,
+            "idle": [d["deployment_id"] for d in members if d["state"] == "idle"],
+        })
+
+    return {
+        "by_deployment": deployments,
+        "pools": pools,
+        "routing": {
+            "gave_up": routing["gave_up"],
+            "rejected_while_capacity_existed": routing["wasted"],
+            "rejected_while_capacity_existed_pct": _pct(routing["wasted"], routing["gave_up"]),
+            "provider_429s": sum(d["provider_429s"] for d in deployments),
+            "multi_attempt_requests": routing["multi_attempt"],
+            "multi_attempt_pct": _pct(routing["multi_attempt"], routing["with_attempts"]),
+            "avg_attempts": _r(routing["avg_attempts"]),
+        },
+    }
 
 
 async def get_metrics_summary(since: datetime | None, until: datetime | None) -> dict:
@@ -169,6 +324,8 @@ async def get_metrics_summary(since: datetime | None, until: datetime | None) ->
     except Exception as ex:                       # table missing: leave the section empty
         log.warning("could not read breaker_events: %s: %s", type(ex).__name__, ex)
 
+    deployments = await _deployment_metrics(pool, W, args)
+
     return {
         "window": {
             "since": (since or t["first_ts"]).isoformat() if (since or t["first_ts"]) else None,
@@ -213,6 +370,7 @@ async def get_metrics_summary(since: datetime | None, until: datetime | None) ->
         },
         "legacy": {"hit_rows_with_zero_latency": t["legacy_hits"]},
         "breaker": {"transitions": transitions},
+        "deployments": deployments,
     }
 
 

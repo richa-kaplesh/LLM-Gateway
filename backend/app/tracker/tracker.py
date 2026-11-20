@@ -1,5 +1,6 @@
 from app.models.schemas import GatewayResponse, CostSummary
 from app.core.db import get_pool
+from app.router.attempt_log import AttemptLog
 import logging
 log = logging.getLogger(__name__)
 
@@ -8,56 +9,68 @@ class CostTracker:
     # then (or if the migration could not run) rows are written WITHOUT them, so logging a
     # request can never fail just because the schema is one step behind the code.
     token_columns = False
+    attempt_columns = False
 
     async def log(self, user_id: str, conversation_id: str, response: GatewayResponse | None,
                    status: str, error_type: str | None = None,
-                   cache_scope: str | None = None, estimated_tokens: int | None = None) -> None:
-        pool = get_pool()
-
+                   cache_scope: str | None = None, estimated_tokens: int | None = None,
+                   request_id: str | None = None, attempts: AttemptLog | None = None) -> None:
         # embed_latency_ms defaults to 0.0 when no embedding call happened
         # (no cache scope, or the request errored). Store NULL in that case,
         # so averages are not dragged down by fake zeros.
         embedded = bool(response and response.embed_latency_ms)
-        embed_latency = response.embed_latency_ms if embedded else None
-        embed_cost = response.embed_cost_usd if embedded else None
 
-        base = (
-            user_id, conversation_id,
-            response.provider_used if response else None,
-            response.model_used if response else None,
-            response.was_fallback if response else False,
-            response.cost_usd if response else 0,
-            response.latency_ms if response else None,
-            estimated_tokens,
-            response.cache_hit if response else False,
-            cache_scope,
-            status, error_type,
-            embed_latency, embed_cost,
-        )
+        row = {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "provider_used": response.provider_used if response else None,
+            "model_used": response.model_used if response else None,
+            "was_fallback": response.was_fallback if response else False,
+            "cost_usd": response.cost_usd if response else 0,
+            "latency_ms": response.latency_ms if response else None,
+            "estimated_tokens": estimated_tokens,
+            "cache_hit": response.cache_hit if response else False,
+            "cache_scope": cache_scope,
+            "status": status,
+            "error_type": error_type,
+            "embed_latency_ms": response.embed_latency_ms if embedded else None,
+            "embed_cost_usd": response.embed_cost_usd if embedded else None,
+        }
         if self.token_columns:
-            await pool.execute(
-                """INSERT INTO request_logs
-                   (user_id, conversation_id, provider_used, model_used, was_fallback,
-                    cost_usd, latency_ms, estimated_tokens, cache_hit, cache_scope,
-                    status, error_type, embed_latency_ms, embed_cost_usd,
-                    input_tokens, output_tokens, thought_tokens, cached_tokens)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)""",
-                *base,
-                response.input_tokens if response else None,
-                response.output_tokens if response else None,
-                response.thought_tokens if response else None,
-                response.cached_tokens if response else None,
-            )
-            return
-        await pool.execute(
-            """INSERT INTO request_logs
-               (user_id, conversation_id, provider_used, model_used, was_fallback,
-                cost_usd, latency_ms, estimated_tokens, cache_hit, cache_scope,
-                status, error_type, embed_latency_ms, embed_cost_usd)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
-            *base,
-        )
-        
+            row.update({
+                "input_tokens": response.input_tokens if response else None,
+                "output_tokens": response.output_tokens if response else None,
+                "thought_tokens": response.thought_tokens if response else None,
+                "cached_tokens": response.cached_tokens if response else None,
+            })
+        if self.attempt_columns:
+            row.update({
+                "request_id": request_id,
+                "deployment_id": attempts.final_deployment_id if attempts else None,
+                "attempts": attempts.count if attempts else None,
+                "capacity_existed": attempts.capacity_existed if attempts else None,
+            })
+
+        columns = ", ".join(row)
+        placeholders = ", ".join(f"${i}" for i in range(1, len(row) + 1))
+        attempt_rows = [
+            (request_id, a.attempt_no, a.deployment_id, a.provider, a.model,
+             a.outcome, a.error_type, a.latency_ms, a.retry_after_s)
+            for a in (attempts.attempts if attempts else [])
+        ] if self.attempt_columns and request_id else []
+
+        async with get_pool().acquire() as conn, conn.transaction():
+            await conn.execute(f"INSERT INTO request_logs ({columns}) VALUES ({placeholders})",
+                               *row.values())
+            if attempt_rows:
+                await conn.executemany(
+                    """INSERT INTO attempt_logs
+                       (request_id, attempt_no, deployment_id, provider, model,
+                        outcome, error_type, latency_ms, retry_after_s)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+                    attempt_rows,
+                )
+
     async def log_breaker_transition(self, provider: str, old_state: str, new_state: str) -> None:
         log.warning("circuit breaker %s: %s -> %s", provider, old_state, new_state)
         pool = get_pool()

@@ -116,4 +116,23 @@ class CircuitBreaker:
         }
 
 
-breakers = {"groq": CircuitBreaker(), "gemini": CircuitBreaker()}
+ModelGroup = tuple[str, str]
+
+_breakers: dict[ModelGroup, CircuitBreaker] = {}
+
+
+def breaker_for(group: ModelGroup) -> CircuitBreaker:
+    breaker = _breakers.get(group)
+    if breaker is None:
+        breaker = CircuitBreaker()
+        _breakers[group] = breaker
+    return breaker
+
+
+def group_label(group: ModelGroup) -> str:
+    provider, model = group
+    return f"{provider}:{model}"
+
+
+def reset_breakers() -> None:
+    _breakers.clear()

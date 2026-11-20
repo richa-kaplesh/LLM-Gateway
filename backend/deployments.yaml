@@ -1,0 +1,77 @@
+deployments:
+  - id: groq-1
+    provider: groq
+    adapter: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    key_env: GROQ_API_KEY_1
+    model: openai/gpt-oss-20b
+    limits: {rpm: 30, tpm: 8000, rpd: 1000, tpd: 200000}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0.15, output: 0.60, cached_input: null}
+
+  - id: groq-2
+    provider: groq
+    adapter: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    key_env: GROQ_API_KEY_2
+    model: openai/gpt-oss-20b
+    limits: {rpm: 30, tpm: 8000, rpd: 1000, tpd: 200000}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0.15, output: 0.60, cached_input: null}
+
+  - id: groq-3
+    provider: groq
+    adapter: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    key_env: GROQ_API_KEY_3
+    model: openai/gpt-oss-20b
+    limits: {rpm: 30, tpm: 8000, rpd: 1000, tpd: 200000}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0.15, output: 0.60, cached_input: null}
+
+  - id: or-1
+    provider: openrouter
+    adapter: openai_compatible
+    base_url: https://openrouter.ai/api/v1
+    key_env: OPENROUTER_API_KEY_1
+    model: google/gemma-4-31b-it:free
+    limits: {rpm: 20, tpm: null, rpd: 50, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0, output: 0, cached_input: null}
+
+  - id: or-2
+    provider: openrouter
+    adapter: openai_compatible
+    base_url: https://openrouter.ai/api/v1
+    key_env: OPENROUTER_API_KEY_2
+    model: google/gemma-4-31b-it:free
+    limits: {rpm: 20, tpm: null, rpd: 50, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0, output: 0, cached_input: null}
+
+  - id: gemini-1
+    enabled: false
+    provider: gemini
+    adapter: gemini
+    key_env: GEMINI_API_KEY_1
+    model: gemini-3.8-flash
+    limits: {rpm: 5, tpm: 250000, rpd: 20, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0.075, output: 0.30, cached_input: null}
+
+  - id: gemini-2
+    enabled: false
+    provider: gemini
+    adapter: gemini
+    key_env: GEMINI_API_KEY_2
+    model: gemini-3.8-flash
+    limits: {rpm: 5, tpm: 250000, rpd: 20, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0.075, output: 0.30, cached_input: null}

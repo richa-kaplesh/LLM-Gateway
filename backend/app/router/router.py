@@ -1,88 +1,37 @@
-"""LLM Gateway router — provider + key selection, fallback, and rotation.
-
-Rotation rules
-──────────────
-1. Pick the primary provider (sticky routing / weighted random).
-2. Call it with the current key.
-3. If rate-limited (429 / ProviderRateLimitedError):
-   a. Put that key on cooldown (Retry-After respected when present).
-   b. Try the OTHER provider with its first available key.
-   c. If the other provider is also rate-limited: go back to the primary and
-      try its NEXT available key, then the other provider's next key, and so
-      on — alternating until all keys on both providers are exhausted.
-   d. If every key on every provider is rate-limited: return
-      AllProvidersRateLimitedError with the soonest retry time.
-4. If a provider's circuit breaker is open, skip that provider (all its keys)
-   and use the other one. An open breaker is not "provider down"; it means
-   "this one is resting".
-5. If a provider returns a server-side failure (5xx, auth failure, wrong model):
-   stop immediately — no key rotation, no fallback.  Return a clear error
-   that names the provider and includes the underlying cause.
-   (Connection errors/timeouts are different: they fall back to the other provider.)
-
-The classify_error() helper in exceptions.py is the single place that encodes
-the "rotate vs stop" decision, making it easy to read and test independently.
-"""
-
-from app.clients import groq_client, gemini_client
-from app.cache.cache import get_cache_for
-from app.models.schemas import GatewayRequest, GatewayResponse
-from app.router.bucket import (
-    get_provider_for_conversation, pin_conversation, reserve_capacity,
-    release_capacity, key_fits, key_wait, max_request_tokens, per_key_limits,
-)
-from app.tracker.tracker import tracker
-from app.router.circuit_breaker import breakers
-from app.core.config import get_settings
-from app.clients.exceptions import (
-    InvalidRequestError, TooLongError, AllProvidersRateLimitedError,
-    AllProvidersUnavailableError, ProviderRateLimitedError, CircuitOpenError,
-    ProviderDownError, ProviderConnectionError, ProviderKeyError, classify_error,
-)
-from app.clients.key_manager import KeyManager
 import asyncio
+import dataclasses
 import json
-import tiktoken
 import logging
 import time
+
+import tiktoken
+
+from app.cache.cache import get_cache_for
+from app.clients import adapters
+from app.clients.exceptions import (
+    AllProvidersRateLimitedError, AllProvidersUnavailableError, CircuitOpenError,
+    InvalidRequestError, LocalCapacityError, ProviderConnectionError, ProviderKeyError,
+    ProviderRateLimitedError, TooLongError,
+)
+from app.core.config import get_settings
+from app.core.registry import get_deployments
+from app.models.deployment import Deployment
+from app.models.schemas import GatewayRequest, GatewayResponse
+from app.router import attempt_log, cooldowns, sticky
+from app.router.circuit_breaker import breaker_for, group_label
+from app.router.limiter import limiter_for
+from app.router.selection import (
+    Need, available, can_serve, pick, soonest_breaker_wait, soonest_rate_limit_wait,
+)
+from app.tracker.tracker import tracker
 
 log = logging.getLogger(__name__)
 settings = get_settings()
 _encoder = tiktoken.get_encoding("cl100k_base")
 
-CLIENTS = {"groq": groq_client, "gemini": gemini_client}
-
-# ── Per-provider key managers (initialised once at import time) ────────────
-_key_managers: dict[str, KeyManager] = {
-    "groq":   KeyManager("groq",   settings.groq_keys()),
-    "gemini": KeyManager("gemini", settings.gemini_keys()),
-}
-
-DB_TIMEOUT_SECONDS = 2.0   # the database must never be able to stall or fail a request
-
-
-def _fits(p: str, tokens: int):
-    """Predicate for KeyManager.next_available: skip keys whose own bucket is dry."""
-    return lambda ks: key_fits(p, ks.key, tokens)
-
-
-def _provider_fits(p: str, tokens: int) -> bool:
-    return any(key_fits(p, ks.key, tokens) for ks in _key_managers[p].keys())
-
-
-def _provider_wait(p: str, tokens: int) -> float | None:
-    """Seconds until some key on p is both off cooldown and has bucket room. None = never."""
-    waits = []
-    for ks in _key_managers[p].keys():
-        w = key_wait(p, ks.key, tokens)
-        if w is not None:
-            waits.append(max(w, ks.cooldown_remaining))
-    return min(waits) if waits else None
-
-
-def _weights() -> dict:
-    """Provider weights follow real capacity: per-key RPM x number of keys."""
-    return {p: max(1, per_key_limits(p)[0] * _key_managers[p].key_count()) for p in ("groq", "gemini")}
+DB_TIMEOUT_SECONDS = 2.0
+MAX_EXTRA_ATTEMPTS = 2
+QUEUE_WAKE_MARGIN_SECONDS = 0.05
 
 
 def estimate_tokens(messages: list[dict]) -> int:
@@ -91,9 +40,6 @@ def estimate_tokens(messages: list[dict]) -> int:
 
 
 def estimate_request_tokens(request: GatewayRequest) -> int:
-    """What this request will cost against a provider's TPM: the messages, the
-    tools schema (sent on every call), and an allowance for the generated output
-    (providers count input + output)."""
     total = estimate_tokens(request.messages)
     if request.tools:
         total += len(_encoder.encode(json.dumps(request.tools)))
@@ -104,356 +50,162 @@ def _has_tool_history(messages: list[dict]) -> bool:
     return any(m.get("role") == "tool" or m.get("tool_calls") for m in messages)
 
 
-async def _record_transition(p: str, before: str, after: str) -> None:
-    """Persist a breaker transition. Best-effort: a DB problem must not be able
-    to leave the breaker half-open or fail the request."""
+async def _record_transition(deployment: Deployment, before: str, after: str) -> None:
+    label = group_label(deployment.model_group)
     try:
-        await asyncio.wait_for(tracker.log_breaker_transition(p, before, after), DB_TIMEOUT_SECONDS)
+        await asyncio.wait_for(tracker.log_breaker_transition(label, before, after), DB_TIMEOUT_SECONDS)
     except Exception as e:
         log.warning("could not persist breaker transition %s %s->%s: %s: %s",
-                    p, before, after, type(e).__name__, e)
+                    label, before, after, type(e).__name__, e)
 
 
-async def _call_with_retry(client_module, request, api_key: str, attempts=3, delay=2.0):
-    name = client_module.__name__.rsplit(".", 1)[-1]    # "groq_client" / "gemini_client"
-    last_error = None
-    for i in range(attempts):
-        t0 = time.perf_counter()
-        try:
-            return await client_module.complete(request, api_key=api_key)
-        except (InvalidRequestError, ProviderRateLimitedError, ProviderConnectionError, ProviderKeyError):
-            raise          # retrying the same provider can't help (a timeout would cost 60s per retry)
-        except Exception as e:
-            last_error = e
-            log.warning("%s call failed after %.0f ms (attempt %d/%d): %s",
-                        name, (time.perf_counter() - t0) * 1000, i + 1, attempts, e)
-            if i < attempts - 1:
-                await asyncio.sleep(delay)
-    raise last_error
+async def _attempt(deployment: Deployment, request: GatewayRequest, tokens: int) -> GatewayResponse:
+    limiter = limiter_for(deployment)
+    reservation = limiter.reserve(tokens)
+    if reservation is None:
+        raise LocalCapacityError(f"{deployment.id} has no local capacity",
+                                 retry_after=limiter.seconds_until_fits(tokens))
 
-
-async def _attempt_provider(p: str, request: GatewayRequest, estimated_tokens: int,
-                            reserve: bool, api_key: str) -> GatewayResponse:
-    """One provider + one key, with breaker + capacity bookkeeping.
-    Capacity is per KEY: reserve=True spends this key's own RPM/TPM bucket."""
-    if reserve:
-        ok, wait = reserve_capacity(p, estimated_tokens, api_key)
-        if not ok:
-            raise ProviderRateLimitedError(f"{p} has no capacity right now", retry_after=wait)
-
-    breaker = breakers[p]
+    breaker = breaker_for(deployment.model_group)
     state_before = breaker.state
     if not breaker.allow_request():
-        release_capacity(p, estimated_tokens, api_key)         # nothing was sent, give it back
-        log.warning("circuit %s for %s, skipping it", breaker.state, p)
-        raise CircuitOpenError(f"{p} circuit is {breaker.state}, skipping", retry_after=breaker.retry_after())
+        limiter.release(reservation)
+        raise CircuitOpenError(f"{group_label(deployment.model_group)} circuit is {breaker.state}",
+                               retry_after=breaker.retry_after())
 
-    t0 = time.perf_counter()
+    started = time.perf_counter()
     try:
-        if breaker.state != state_before:             # open -> half_open: we are the probe
-            await _record_transition(p, state_before, breaker.state)
+        if breaker.state != state_before:
+            await _record_transition(deployment, state_before, breaker.state)
             state_before = breaker.state
-        resp = await _call_with_retry(CLIENTS[p], request, api_key=api_key)
+        response = await adapters.complete(request, deployment)
         breaker.record_success()
-        log.info("provider call ok: provider=%s model=%s latency_ms=%.0f total_ms=%.0f cost_usd=%.6f",
-                 p, resp.model_used, resp.latency_ms,
-                 (time.perf_counter() - t0) * 1000, resp.cost_usd)
-        return resp
+        cooldowns.record_success(deployment.id)
+        log.info("provider call ok: deployment=%s model=%s latency_ms=%.0f total_ms=%.0f cost_usd=%.6f",
+                 deployment.id, deployment.model, response.latency_ms,
+                 (time.perf_counter() - started) * 1000, response.cost_usd)
+        return response
     except InvalidRequestError as e:
         breaker.record_inconclusive()
-        release_capacity(p, estimated_tokens, api_key)
-        log.info("provider %s rejected the request as invalid: %s", p, e)
+        limiter.release(reservation)
+        log.info("deployment %s rejected the request as invalid: %s", deployment.id, e)
         raise
     except ProviderRateLimitedError as e:
-        # alive but busy: not a failure, and NOT a provider-wide pause. The router puts
-        # only THIS key on cooldown so the provider's other keys can still be tried.
         breaker.record_reachable()
-        release_capacity(p, estimated_tokens, api_key)
-        log.warning("provider %s answered 429 (retry_after=%s): %s", p, e.retry_after, e)
+        limiter.release(reservation)
+        cooldowns.record_rate_limited(deployment.id, e.retry_after)
         raise
-    except ProviderKeyError as e:
-        # this KEY was rejected; the provider itself is fine (don't count a breaker failure)
+    except ProviderKeyError:
         breaker.record_reachable()
-        release_capacity(p, estimated_tokens, api_key)
-        log.error("provider %s rejected an API key: %s", p, e)
+        limiter.release(reservation)
+        cooldowns.record_bad_key(deployment.id)
         raise
     except asyncio.CancelledError:
-        breaker.record_inconclusive()                 # a cancelled probe must not wedge half_open
-        release_capacity(p, estimated_tokens, api_key)
+        breaker.record_inconclusive()
+        limiter.release(reservation)
         raise
     except Exception as e:
         breaker.record_failure()
         if isinstance(e, ProviderConnectionError):
-            release_capacity(p, estimated_tokens, api_key)     # request most likely never completed
-        log.warning("provider %s failed (breaker=%s, consecutive_failures=%d): %s",
-                    p, breaker.state, breaker.consecutive_failures, e)
+            limiter.release(reservation)
+        log.warning("deployment %s failed (breaker=%s, consecutive_failures=%d): %s",
+                    deployment.id, breaker.state, breaker.consecutive_failures, e)
         raise
     finally:
         if breaker.state != state_before:
-            await _record_transition(p, state_before, breaker.state)
+            await _record_transition(deployment, state_before, breaker.state)
 
 
-def _combine_failures(p1: str, e1: Exception, p2: str, e2: Exception) -> Exception:
-    """Turn two provider failures into ONE clean error with a Retry-After hint:
-    429 if both were rate limits, 503 otherwise (never a bare 500)."""
-    hints = [e.retry_after for e in (e1, e2)
-             if isinstance(e, (ProviderRateLimitedError, CircuitOpenError)) and e.retry_after is not None]
-    retry_after = min(hints) if hints else None
-    detail = f"{p1}: {e1} | {p2}: {e2}"
-    if isinstance(e1, ProviderRateLimitedError) and isinstance(e2, ProviderRateLimitedError):
-        return AllProvidersRateLimitedError(f"Both providers are rate-limited right now. {detail}",
-                                            retry_after=retry_after)
-    return AllProvidersUnavailableError(f"No provider could serve the request. {detail}",
-                                        retry_after=retry_after)
+async def _tracked_attempt(deployment: Deployment, request: GatewayRequest, tokens: int) -> GatewayResponse:
+    started = time.perf_counter()
+    try:
+        response = await _attempt(deployment, request, tokens)
+    except BaseException as e:
+        called_provider = not isinstance(e, (LocalCapacityError, CircuitOpenError))
+        latency = (time.perf_counter() - started) * 1000 if called_provider else None
+        attempt_log.current().record(deployment, latency, e)
+        raise
+    attempt_log.current().record(deployment, (time.perf_counter() - started) * 1000)
+    return response
 
 
-# ── Multi-key rotation ─────────────────────────────────────────────────────
+def _capacity_existed(deployments: tuple[Deployment, ...], need: Need) -> bool:
+    unpinned = dataclasses.replace(need, required_group=None)
+    return bool(available(deployments, unpinned, exclude=set()))
 
-async def _route_with_key_rotation(
-    primary: str,
-    request: GatewayRequest,
-    estimated_tokens: int,
-) -> GatewayResponse:
-    """Implement the full rotation policy across all keys on both providers.
 
-    Algorithm:
-    1. Try primary provider with its next available key (capacity already reserved).
-    2. On rate-limit: put that key on cooldown, try OTHER provider (first available key).
-    3. If other is also rate-limited: alternate back to primary's next key, then other's
-       next key, until all keys on both providers are exhausted.
-    4. On provider-down (non-rate-limit error): stop immediately, raise ProviderDownError.
-    5. All keys exhausted: raise AllProvidersRateLimitedError with soonest retry.
+def _need_for(request: GatewayRequest, tool_history: bool, tokens: int,
+              deployments: tuple[Deployment, ...]) -> Need:
+    pinned = sticky.pinned_group(request.conversation_id)
+    served_groups = {d.model_group for d in deployments}
+    required = pinned if tool_history and pinned in served_groups else None
+    return Need(tokens=tokens, needs_tools=bool(request.tools) or tool_history, required_group=required)
 
-    Note: _attempt_provider() still manages the circuit-breaker and RPM/TPM buckets.
-    The key manager manages per-key cooldowns (from 429 Retry-After).
-    """
-    fallback = _other_provider(primary)
-    km_primary = _key_managers[primary]
-    km_fallback = _key_managers[fallback]
 
-    # Track the last rate-limit error from each provider for building the final error
-    last_rl_primary: ProviderRateLimitedError | None = None
-    last_rl_fallback: ProviderRateLimitedError | None = None
-    # Providers whose circuit breaker is open: every key on them is skipped.
-    # An open breaker is NOT "provider down": it means "skip this one, use the other".
-    circuit_open: dict[str, CircuitOpenError] = {}
-    # Rejected keys per provider. One bad key must not take a provider down: it is
-    # benched and the next key is tried; only if ALL keys are rejected is the provider out.
-    key_errors: dict[str, list[ProviderKeyError]] = {}
-    # Providers that failed with a transient/unclassified error (timeout, 5xx, ...). They are
-    # NOT fatal for the request: the other provider is still tried. Only if nothing else
-    # works does this become a 503 that names the cause.
-    failed: dict[str, Exception] = {}
+def _check_servable(need: Need, deployments: tuple[Deployment, ...]) -> None:
+    if any(can_serve(d, need) for d in deployments):
+        return
+    if not any(limiter_for(d).can_ever_fit(need.tokens) for d in deployments):
+        raise TooLongError(f"Prompt is too long ({need.tokens} tokens) for any configured deployment")
+    raise InvalidRequestError("No configured deployment supports tool calling for this request")
 
-    tried_primary_key: str | None = None
-    tried_fallback_key: str | None = None
 
-    # First attempt: primary provider (capacity already reserved in route())
-    ks = km_primary.next_available(fits=_fits(primary, estimated_tokens))
-    if ks is None:
-        log.warning("no %s key is available (cooldown or per-key limit) at start", primary)
-    while ks is not None:
-        tried_primary_key = ks.key
-        log.info("routing request: provider=%s key=%s", primary, ks.masked)
+def _give_up(deployments, need: Need, failed: set[str], failures: list[str]) -> Exception:
+    attempt_log.current().capacity_existed = _capacity_existed(deployments, need)
+    detail = "; ".join(failures) or "no deployment has capacity right now"
+    if need.required_group is not None:
+        detail += (f" (conversation has tool history and must stay on "
+                   f"{group_label(need.required_group)})")
+    wait = soonest_rate_limit_wait(deployments, need, failed)
+    if wait is not None:
+        return AllProvidersRateLimitedError(f"All deployments are busy. {detail}", retry_after=wait)
+    return AllProvidersUnavailableError(f"No deployment is available. {detail}",
+                                        retry_after=soonest_breaker_wait(deployments, need, failed))
+
+
+async def _serve(request: GatewayRequest, need: Need,
+                 deployments: tuple[Deployment, ...]) -> GatewayResponse:
+    preferred = sticky.pinned_group(request.conversation_id)
+    deadline = time.monotonic() + settings.MAX_QUEUE_WAIT_SECONDS
+    failed: set[str] = set()
+    failures: list[str] = []
+    first_group = None
+    attempts = 0
+    while True:
+        candidates = available(deployments, need, failed)
+        if not candidates:
+            wait = soonest_rate_limit_wait(deployments, need, failed)
+            if wait is not None and time.monotonic() + wait <= deadline:
+                log.info("all deployments busy; waiting %.1f s for capacity", wait)
+                await asyncio.sleep(wait + QUEUE_WAKE_MARGIN_SECONDS)
+                continue
+            raise _give_up(deployments, need, failed, failures)
+
+        deployment = pick(candidates, preferred)
+        first_group = first_group or deployment.model_group
+        attempts += 1
+        log.info("routing request: deployment=%s attempt=%d", deployment.id, attempts)
         try:
-            # every attempt reserves capacity on the key it is about to use
-            resp = await _attempt_provider(primary, request, estimated_tokens,
-                                           reserve=True, api_key=ks.key)
-            km_primary.record_success(ks)
-            return resp
+            response = await _tracked_attempt(deployment, request, need.tokens)
         except InvalidRequestError:
             raise
-        except ProviderKeyError as e:
-            km_primary.record_auth_failed(ks)
-            key_errors.setdefault(primary, []).append(e)
-            log.warning("rotation: %s key %s rejected; trying this provider's next key", primary, ks.masked)
-            ks = km_primary.next_available(skip_key=ks.key, fits=_fits(primary, estimated_tokens))
-            continue
-        except ProviderRateLimitedError as e:
-            km_primary.record_rate_limited(ks, e.retry_after)
-            last_rl_primary = e
-            log.warning("rotation: %s key %s rate-limited; trying %s", primary, ks.masked, fallback)
-        except CircuitOpenError as e:
-            circuit_open[primary] = e
-            log.warning("rotation: %s circuit is open; skipping it, trying %s", primary, fallback)
-        except ProviderConnectionError as e:
-            # Transient failure (DNS/TCP/timeout/5xx). Don't penalise the key
-            # (it may recover); go try the other provider.
-            failed[primary] = e
-            log.warning("rotation: %s transient error; falling back to %s: %s", primary, fallback, e)
+        except (ProviderRateLimitedError, CircuitOpenError) as e:
+            failures.append(f"{deployment.id}: {e}")
         except Exception as e:
-            # Anything else this provider threw: still not a reason to give up while the
-            # other provider (and its keys) may work.
-            failed[primary] = e
-            log.error("rotation: %s failed with %s: %s; falling back to %s",
-                      primary, type(e).__name__, e, fallback)
-        break
-
-    # Alternating loop: fallback -> primary -> fallback -> ...
-    # Each iteration picks one key from whichever side is "next".
-    turn = fallback      # who we are about to try
-    for _ in range(2 * (km_primary.key_count() + km_fallback.key_count()) + 2):
-        if len(set(circuit_open) | set(failed)) == 2:
-            break
-        if turn in circuit_open or turn in failed:   # breaker open, or it just errored: skip its other keys
-            turn = _other_provider(turn)
-            continue
-
-        km = km_fallback if turn == fallback else km_primary
-        skip = tried_fallback_key if turn == fallback else tried_primary_key
-
-        ks = km.next_available(skip_key=skip, fits=_fits(turn, estimated_tokens))
-        if ks is None:
-            log.info("no available keys left on %s, switching side", turn)
-            turn = _other_provider(turn)
-            if _all_sides_dry(km_primary, km_fallback, {**circuit_open, **failed}, estimated_tokens):
-                break
-            continue
-
-        if turn == fallback:
-            tried_fallback_key = ks.key
+            failed.add(deployment.id)
+            failures.append(f"{deployment.id}: {type(e).__name__}: {e}")
         else:
-            tried_primary_key = ks.key
+            response.attempts = attempts
+            response.was_fallback = deployment.model_group != first_group
+            return response
 
-        log.info("rotation: trying provider=%s key=%s", turn, ks.masked)
-        try:
-            # reserve=True on both sides: the first attempt's reservation was already
-            # released (429 / open circuit / connection error), so re-reserve each time.
-            resp = await _attempt_provider(turn, request, estimated_tokens,
-                                           reserve=True, api_key=ks.key)
-            km.record_success(ks)
-            return resp
-        except InvalidRequestError:
-            raise
-        except ProviderKeyError as e:
-            km.record_auth_failed(ks)
-            key_errors.setdefault(turn, []).append(e)
-            log.warning("rotation: %s key %s rejected; trying this provider's next key", turn, ks.masked)
-            continue                                   # same provider, next key (don't switch sides)
-        except ProviderRateLimitedError as e:
-            km.record_rate_limited(ks, e.retry_after)
-            if turn == fallback:
-                last_rl_fallback = e
-            else:
-                last_rl_primary = e
-            log.warning("rotation: %s key %s rate-limited; switching to other side", turn, ks.masked)
-        except CircuitOpenError as e:
-            circuit_open[turn] = e
-            log.warning("rotation: %s circuit is open; skipping the provider", turn)
-        except ProviderConnectionError as e:
-            # Transient error in the alternating loop - log and keep rotating
-            # (other keys/providers may work; don't stop here).
-            failed[turn] = e
-            log.warning("rotation: %s transient error; continuing rotation: %s", turn, e)
-        except Exception as e:
-            failed[turn] = e
-            log.error("rotation: %s failed with %s: %s; continuing rotation", turn, type(e).__name__, e)
-
-        turn = _other_provider(turn)
-
-    # Nothing could serve the request.
-    notes = [f"{p}: {len(errs)} key(s) rejected, last error: {errs[-1]}" for p, errs in key_errors.items()]
-    notes += [f"{p}: {type(e).__name__}: {e}" for p, e in failed.items()]
-    # A provider that is merely busy (keys cooling down or out of their own RPM/TPM budget)
-    # makes this a 429 with a Retry-After, not a 503. Only when every provider is really out
-    # (breaker open, or all its keys rejected) is it "unavailable".
-    busy = [name for name in (primary, fallback)
-            if name not in circuit_open and name not in failed and any(not ks.auth_failed for ks in _key_managers[name].keys())]
-    if (circuit_open or key_errors or failed) and not busy and last_rl_primary is None and last_rl_fallback is None:
-        parts = [str(e) for e in circuit_open.values()] + notes
-        hints = [e.retry_after for e in circuit_open.values() if e.retry_after is not None]
-        log.error("no provider available: %s", "; ".join(parts))
-        raise AllProvidersUnavailableError(
-            "No provider available: " + "; ".join(parts),
-            retry_after=min(hints) if hints else None,
-        )
-
-    candidates = [_provider_wait(name, estimated_tokens)
-                  for name in (primary, fallback)
-                  if name not in circuit_open]
-    candidates += [e.retry_after for e in circuit_open.values()]
-    soonest = min((t for t in candidates if t is not None), default=None)
-    errors = " | ".join(filter(None, [str(last_rl_primary), str(last_rl_fallback)] + notes))
-    log.error(
-        "all keys exhausted on both providers (groq=%d keys, gemini=%d keys); "
-        "soonest retry in %.0f s",
-        _key_managers["groq"].key_count(), _key_managers["gemini"].key_count(), soonest or 0,
-    )
-    raise AllProvidersRateLimitedError(
-        f"All keys on every provider are rate-limited. {errors}",
-        retry_after=soonest,
-    )
-
-
-def _all_sides_dry(km_primary: KeyManager, km_fallback: KeyManager, circuit_open: dict,
-                   estimated_tokens: int = 0) -> bool:
-    """True when no side has a usable key left (cooled down, over its own limit, or breaker open)."""
-    for name, km in ((km_primary.provider, km_primary), (km_fallback.provider, km_fallback)):
-        if name in circuit_open:
-            continue
-        if any(ks.available and key_fits(name, ks.key, estimated_tokens) for ks in km.keys()):
-            return False
-    return True
-
-
-async def _route_pinned(provider: str, request: GatewayRequest, estimated_tokens: int) -> GatewayResponse:
-    """Rotate keys on ONE provider only; never fall back to the other.
-
-    Used when a conversation already has tool history and is pinned to Groq. Gemini rejects
-    replayed function calls that lack the thought_signature only Gemini produces, so a
-    Groq-made history cannot safely move to Gemini. (The reverse is fine: the Groq client
-    strips thought_signature, so Gemini -> Groq fallback keeps using the normal rotation.)
-    """
-    km = _key_managers[provider]
-    last_rl: ProviderRateLimitedError | None = None
-    key_errors: list[ProviderKeyError] = []
-
-    ks = km.next_available(fits=_fits(provider, estimated_tokens))
-    if ks is None:
-        log.warning("no %s key is available (cooldown or per-key limit) at start", provider)
-    while ks is not None:
-        log.info("routing request (pinned, tool history): provider=%s key=%s", provider, ks.masked)
-        try:
-            resp = await _attempt_provider(provider, request, estimated_tokens,
-                                           reserve=True, api_key=ks.key)
-            km.record_success(ks)
-            return resp
-        except InvalidRequestError:
-            raise
-        except ProviderKeyError as e:
-            km.record_auth_failed(ks)
-            key_errors.append(e)
-        except ProviderRateLimitedError as e:
-            km.record_rate_limited(ks, e.retry_after)
-            last_rl = e
-        except CircuitOpenError as e:
-            raise AllProvidersUnavailableError(
-                f"{provider} is unavailable and this conversation cannot move to another provider "
-                f"(it has tool-call history): {e}", retry_after=e.retry_after)
-        except ProviderConnectionError as e:
-            raise AllProvidersUnavailableError(
-                f"{provider} is unreachable and this conversation cannot move to another provider "
-                f"(it has tool-call history): {e}", retry_after=None)
-        except Exception as e:
-            raise ProviderDownError(provider, e) from e
-        ks = km.next_available(skip_key=ks.key, fits=_fits(provider, estimated_tokens))
-
-    if last_rl is None and key_errors:
-        raise AllProvidersUnavailableError(
-            f"{provider}: {len(key_errors)} key(s) rejected, last error: {key_errors[-1]}")
-    raise AllProvidersRateLimitedError(
-        f"All {provider} keys are rate-limited and this conversation cannot move to another "
-        f"provider (it has tool-call history). {last_rl or ''}".strip(),
-        retry_after=_provider_wait(provider, estimated_tokens),
-    )
+        if attempts > MAX_EXTRA_ATTEMPTS:
+            raise _give_up(deployments, need, failed, failures)
 
 
 async def route(request: GatewayRequest) -> GatewayResponse:
     tool_history = _has_tool_history(request.messages)
 
-    # The cache key is only the last user message. A tool-enabled request, or one that is
-    # mid tool-call loop, depends on far more than that (tools, history, thought_signature),
-    # so serving or storing it from the cache would replay another conversation's tool calls.
     use_cache = not (request.tools or request.is_tool_related or tool_history)
     cache = get_cache_for(request) if use_cache else None
     lookup = None
@@ -461,78 +213,24 @@ async def route(request: GatewayRequest) -> GatewayResponse:
         try:
             lookup = await cache.get(request)
         except Exception as e:
-            # Jina down/rate-limited must not take the whole gateway down: skip the cache
             log.warning("cache lookup failed, continuing without cache: %s: %s", type(e).__name__, e)
             cache = None
         else:
             if lookup.hit:
                 return lookup.hit
 
-    estimated_tokens = estimate_request_tokens(request)
-    if estimated_tokens > max_request_tokens():
-        raise TooLongError(f"Prompt is too long ({estimated_tokens} tokens) for any configured provider")
+    deployments = get_deployments()
+    need = _need_for(request, tool_history, estimate_request_tokens(request), deployments)
+    _check_servable(need, deployments)
 
-    # If every key is merely busy (out of its own budget, or cooling down after a 429), waiting
-    # a few seconds beats failing: wait up to MAX_QUEUE_WAIT_SECONDS for one to free up.
-    deadline = time.monotonic() + settings.MAX_QUEUE_WAIT_SECONDS
-    was_fallback = False
-    while True:
-        provider = get_provider_for_conversation(
-            request.conversation_id, estimated_tokens,
-            fits=lambda p: _provider_fits(p, estimated_tokens),
-            must_stick=tool_history, weights=_weights(),
-        )
-        if provider is None:
-            wait = min((w for w in (_provider_wait(p, estimated_tokens) for p in ("groq", "gemini"))
-                        if w is not None), default=None)
-            if wait is not None and time.monotonic() + wait <= deadline:
-                log.info("all keys busy; waiting %.1f s for capacity", wait)
-                await asyncio.sleep(wait + 0.05)
-                continue
-            raise AllProvidersRateLimitedError(
-                "Every key on both providers is rate-limited right now. Try again shortly.",
-                retry_after=wait,
-            )
-        try:
-            if tool_history and provider == "groq":
-                response = await _route_pinned(provider, request, estimated_tokens)
-            else:
-                response = await _route_with_key_rotation(provider, request, estimated_tokens)
-
-            # Detect whether we ended up on the fallback provider so we can re-pin
-            if response.provider_used != provider:
-                was_fallback = True
-                pin_conversation(request.conversation_id, response.provider_used)
-                log.info("fallback succeeded: conversation=%s re-pinned from %s to %s",
-                         request.conversation_id, provider, response.provider_used)
-            break
-        except AllProvidersRateLimitedError as e:
-            if e.retry_after is not None and time.monotonic() + e.retry_after <= deadline:
-                log.info("all keys busy after rotation; waiting %.1f s then retrying", e.retry_after)
-                await asyncio.sleep(e.retry_after + 0.05)
-                continue
-            raise
-        except ProviderDownError as e:
-            log.error("provider %s is down: %s", e.provider, e.cause)
-            raise AllProvidersUnavailableError(
-                f"Provider {e.provider!r} is down: {e.cause}",
-                retry_after=None,
-            )
-        except InvalidRequestError:
-            raise
-
-    response.was_fallback = was_fallback
+    response = await _serve(request, need, deployments)
+    sticky.pin(request.conversation_id, (response.provider_used, response.model_used))
 
     if cache and lookup and lookup.embedding:
         emb = lookup.embedding
-        cache.set(request, response.model_copy(deep=True), emb)   # store a pure copy of the LLM response
-        # a miss really costs the embedding call on top of the LLM call
+        cache.set(request, response.model_copy(deep=True), emb)
         response.embed_latency_ms = emb.latency_ms
         response.embed_cost_usd = emb.cost_usd
         response.latency_ms += emb.latency_ms
         response.cost_usd += emb.cost_usd
     return response
-
-
-def _other_provider(provider: str) -> str:
-    return "gemini" if provider == "groq" else "groq"

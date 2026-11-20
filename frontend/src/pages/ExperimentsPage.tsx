@@ -9,17 +9,13 @@ import {
   ResponsiveContainer,
   Cell,
 } from 'recharts'
-import { FlaskConical, RefreshCw, Loader2, ShieldCheck, TrendingDown, TrendingUp, Minus } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { FlaskConical, RefreshCw, Loader2, KeyRound, ChevronRight, TrendingDown, TrendingUp, Minus } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  fetchExperiments,
-  fetchBreakerStatus,
-  type ExperimentRecord,
-  type BreakerStatusMap,
-} from '@/lib/api'
+import { fetchExperiments, type ExperimentRecord } from '@/lib/api'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -117,37 +113,6 @@ function ChartTooltip({
         </p>
       ))}
     </div>
-  )
-}
-
-// ── Breaker state badge ────────────────────────────────────────────────────────
-const BREAKER_STYLES = {
-  closed: {
-    dot:   'bg-green-500',
-    badge: 'border-green-200 bg-green-50 text-green-800',
-    label: 'Closed',
-  },
-  open: {
-    dot:   'bg-red-500',
-    badge: 'border-red-200 bg-red-50 text-red-700',
-    label: 'Open',
-  },
-  half_open: {
-    dot:   'bg-amber-500',
-    badge: 'border-amber-200 bg-amber-50 text-amber-800',
-    label: 'Half-open',
-  },
-} as const
-
-function BreakerBadge({ state }: { state: 'closed' | 'open' | 'half_open' }) {
-  const s = BREAKER_STYLES[state] ?? BREAKER_STYLES.open
-  return (
-    <span
-      className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs font-medium ${s.badge}`}
-    >
-      <span className={`w-1.5 h-1.5 rounded-full ${s.dot}`} />
-      {s.label}
-    </span>
   )
 }
 
@@ -431,7 +396,6 @@ function CategorySection({ category, experiments }: CategorySectionProps) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 export function ExperimentsPage() {
   const [experiments, setExperiments] = useState<ExperimentRecord[]>([])
-  const [breakers, setBreakers]       = useState<BreakerStatusMap>({})
   const [loading, setLoading]         = useState(true)
   const [refreshing, setRefreshing]   = useState(false)
 
@@ -439,9 +403,7 @@ export function ExperimentsPage() {
     if (isRefresh) setRefreshing(true)
     else setLoading(true)
     try {
-      const [exps, bkrs] = await Promise.all([fetchExperiments(), fetchBreakerStatus()])
-      setExperiments(exps)
-      setBreakers(bkrs)
+      setExperiments(await fetchExperiments())
     } catch (err) {
       toast.error((err as Error).message || 'Failed to load experiments.')
     } finally {
@@ -465,15 +427,13 @@ export function ExperimentsPage() {
     return map
   }, [experiments])
 
-  const breakerEntries = Object.entries(breakers)
-
   return (
     <div className="p-4 md:p-6 space-y-6 max-w-6xl mx-auto">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold text-stone-900">Experiments</h1>
-          <p className="text-sm text-stone-500 mt-0.5">Run history and circuit breaker status</p>
+          <p className="text-sm text-stone-500 mt-0.5">Run history and before/after comparisons</p>
         </div>
         <Button
           variant="outline"
@@ -491,44 +451,16 @@ export function ExperimentsPage() {
         </Button>
       </div>
 
-      {/* Circuit breaker status row */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="w-4 h-4 text-stone-400" />
-            <CardTitle>Circuit Breakers</CardTitle>
-          </div>
-        </CardHeader>
-        <CardContent>
-          {loading ? (
-            <div className="flex gap-3 flex-wrap">
-              {[1, 2, 3].map((i) => (
-                <Skeleton key={i} className="h-8 w-32 rounded-lg" />
-              ))}
-            </div>
-          ) : breakerEntries.length === 0 ? (
-            <p className="text-sm text-stone-400">No circuit breaker data available.</p>
-          ) : (
-            <div className="flex flex-wrap gap-3">
-              {breakerEntries.map(([provider, info]) => (
-                <div
-                  key={provider}
-                  className="flex items-center gap-2.5 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2"
-                >
-                  <span className="text-sm font-medium text-stone-700 capitalize">{provider}</span>
-                  <BreakerBadge state={info.state} />
-                  {info.consecutive_failures > 0 && (
-                    <span className="text-xs text-stone-400">
-                      {info.consecutive_failures} failure
-                      {info.consecutive_failures !== 1 ? 's' : ''}
-                    </span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      <Link
+        to="/keys"
+        className="group flex items-center justify-between rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md"
+      >
+        <span className="flex items-center gap-2 text-stone-600">
+          <KeyRound className="h-4 w-4 text-amber-700" />
+          Circuit breakers, cooldowns and per-key capacity now live on the Keys page
+        </span>
+        <ChevronRight className="h-4 w-4 text-stone-400 transition-transform group-hover:translate-x-0.5" />
+      </Link>
 
       {/* Experiment sections grouped by category */}
       {loading ? (

@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-groq
 google-genai
 numpy
 pydantic-settings
@@ -8,3 +7,5 @@ python-dotenv
 httpx
 tiktoken
 asyncpg
+pyyaml
+openai

@@ -140,27 +140,56 @@ export async function fetchExperiments(): Promise<ExperimentRecord[]> {
   return data as ExperimentRecord[]
 }
 
-// ── Circuit breaker status ─────────────────────────────────────────────────────
+// ── Live gateway status (/status) ──────────────────────────────────────────────
 
 export type BreakerState = 'closed' | 'open' | 'half_open'
 
-export interface BreakerInfo {
-  state: BreakerState
-  consecutive_failures: number
+export type Verdict = 'ready' | 'cooling' | 'exhausted' | 'breaker_open' | 'bad_key'
+
+export interface Meter {
+  limit: number
+  used: number
+  remaining: number
+  utilisation_pct: number
+  full_in_s?: number
+  next_free_in_s?: number | null
 }
 
-export type BreakerStatusMap = Record<string, BreakerInfo>
+export interface DeploymentStatus {
+  id: string
+  provider: string
+  model: string
+  tier: string
+  verdict: Verdict
+  ready_in_s: number | null
+  meters: Partial<Record<'rpm' | 'tpm' | 'rpd' | 'tpd', Meter>>
+  cooldown: { cooldown_remaining_s: number; bad_key: boolean }
+  breaker: {
+    group: string
+    state: BreakerState
+    consecutive_failures: number
+    paused_for_seconds: number
+    retry_in_seconds: number
+  }
+}
 
-export async function fetchBreakerStatus(): Promise<BreakerStatusMap> {
-  const res = await fetch(`${API_BASE}/breakers`)
+export interface GatewayStatus {
+  deployments_total: number
+  deployments_ready: number
+  by_verdict: Partial<Record<Verdict, number>>
+  soonest_ready_in_s: number | null
+  deployments: DeploymentStatus[]
+}
+
+export async function fetchStatus(): Promise<GatewayStatus> {
+  const res = await fetch(`${API_BASE}/status`)
 
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText)
     throw new Error(detail || `Request failed with status ${res.status}`)
   }
 
-  const data = await res.json()
-  return data as BreakerStatusMap
+  return res.json() as Promise<GatewayStatus>
 }
 
 // ── Per-request records ────────────────────────────────────────────────────────
@@ -281,6 +310,57 @@ export interface MetricsSummary {
   }
   breaker: {
     transitions: BreakerTransition[]
+  }
+  deployments?: DeploymentMetrics | null
+}
+
+export type DeploymentState = 'active' | 'idle' | 'no_traffic' | 'not_live'
+
+export interface DeploymentHistory {
+  deployment_id: string
+  provider: string
+  model: string
+  state: DeploymentState
+  attempts: number
+  provider_calls: number
+  successes: number
+  local_refusals: number
+  share_of_pool_pct: number | null
+  errors: Record<string, number>
+  error_rate_pct: number | null
+  provider_429s: number
+  latency_ms: { p50: number | null; p95: number | null }
+  tokens: {
+    total_input: number | null
+    total_output: number | null
+    avg_input: number | null
+    avg_output: number | null
+  }
+  last_attempt_at: string | null
+}
+
+export interface PoolHistory {
+  provider: string
+  model: string
+  deployments: string[]
+  enabled: number
+  provider_calls: number
+  fair_share_pct: number | null
+  imbalance_pct: number | null
+  idle: string[]
+}
+
+export interface DeploymentMetrics {
+  by_deployment: DeploymentHistory[]
+  pools: PoolHistory[]
+  routing: {
+    gave_up: number
+    rejected_while_capacity_existed: number
+    rejected_while_capacity_existed_pct: number | null
+    provider_429s: number
+    multi_attempt_requests: number
+    multi_attempt_pct: number | null
+    avg_attempts: number | null
   }
 }
 

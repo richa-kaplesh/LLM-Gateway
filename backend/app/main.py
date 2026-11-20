@@ -1,3 +1,8 @@
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,11 +14,12 @@ from pydantic import BaseModel
 from app.core.config import get_settings
 from app.core.db import init_pool, close_pool
 from app.cache.cache import close_http
-import groq
-from google import genai
+from app.clients.adapters import close_adapters
+from app.core.registry import get_deployments
 from app.experiments.schema import ExperimentRun
 from app.experiments.store import load_runs, save_run
-from app.router.circuit_breaker import breakers
+from app.router import attempt_log
+from app.router.status import gateway_status
 import logging
 from app.clients.exceptions import (
     InvalidRequestError, TooLongError, AllProvidersRateLimitedError, AllProvidersUnavailableError,
@@ -43,19 +49,15 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from app.router.router import _key_managers
-    for _name, _km in _key_managers.items():
-        from app.router.bucket import per_key_limits
-        _rpm, _tpm = per_key_limits(_name)
-        log.info("key pool loaded: provider=%s keys=%d %s | per key: %d RPM, %d TPM | pool: %d RPM, %d TPM",
-                 _name, _km.key_count(), [k["key"] for k in _km.status_summary()],
-                 _rpm, _tpm, _rpm * _km.key_count(), _tpm * _km.key_count())
+    deployments = get_deployments()
+    log.info("registry loaded: %d enabled deployments: %s", len(deployments), [d.id for d in deployments])
     await init_pool()
     try:
         await metrics_store.ensure_tables()
     except Exception as e:   # best-effort: the gateway must still serve requests
         log.warning("could not ensure metric_snapshots table: %s: %s", type(e).__name__, e)
     yield
+    await close_adapters()
     await close_http()
     await close_pool()
 
@@ -93,21 +95,7 @@ async def request_context(request: Request, call_next):
 
 @app.get("/health", response_model=HealthCheck)
 async def health_check():
-    groq_available = True
-    gemini_available = True
-
-    try:
-        groq_client = groq.AsyncGroq(api_key=settings.groq_keys()[0])
-        await groq_client.models.list()
-    except Exception:
-        groq_available = False
-
-    try:
-        genai.Client(api_key=settings.gemini_keys()[0])
-    except Exception:
-        gemini_available = False
-
-    return HealthCheck(status="ok", groq_available=groq_available, gemini_available=gemini_available)
+    return HealthCheck(status="ok", deployments=[d.id for d in get_deployments()])
 
 
 DB_TIMEOUT_SECONDS = 2.0
@@ -122,6 +110,7 @@ async def _track(request: GatewayRequest, response, status: str, error_type: str
                 request.user_id, request.conversation_id, response, status=status,
                 error_type=error_type, cache_scope=request.cache_scope,
                 estimated_tokens=estimate_request_tokens(request),
+                request_id=request_id_var.get(), attempts=attempt_log.current(),
             ),
             DB_TIMEOUT_SECONDS,
         )
@@ -137,6 +126,7 @@ def _retry_headers(retry_after: float | None) -> dict | None:
 
 @app.post("/query", response_model=GatewayResponse)
 async def handle_query(request: GatewayRequest):
+    attempt_log.start()
     try:
         response = await route(request)
     except InvalidRequestError as e:
@@ -210,16 +200,9 @@ async def log_experiment(run: ExperimentRun):
     return save_run(run)
 
 
-@app.get("/breakers")
-async def breaker_status():
-    from app.router.router import _key_managers
-    result = {}
-    for name, b in breakers.items():
-        result[name] = {
-            **b.snapshot(),
-            "keys": _key_managers[name].status_summary(),
-        }
-    return result
+@app.get("/status")
+async def status():
+    return gateway_status(get_deployments())
 
 
 # ── Baseline metrics (computed from request_logs / breaker_events) ─────────────
