@@ -1,32 +1,44 @@
-from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    JINA_API_KEY: str
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # Set from Jina's pricing page; 0.0 means embedding cost is NOT being counted
+    JINA_API_KEY: str = ""
     JINA_COST_PER_MILLION: float = 0.02
 
-    # Rough allowance for the tokens the model will GENERATE (TPM counts input + output)
+    DATABASE_URL: str = ""
+    REDIS_URL: str = ""
+    DEPLOYMENTS_FILE: str = ""
+
+    GATEWAY_API_KEYS: str = ""
+    CORS_ORIGINS: str = "*"
+
     OUTPUT_TOKEN_ALLOWANCE: int = 512
+    DEFAULT_TIER: str = "smart"
+    DAILY_RESERVE_PCT: float = 10.0
 
-    # When every key is merely out of budget / cooling down, wait up to this long for one to
-    # free up instead of failing the request. 0 = fail immediately with 429 + Retry-After.
-    MAX_QUEUE_WAIT_SECONDS: float = 20.0
+    MAX_QUEUE_WAIT_SECONDS: float = 10.0
+    MAX_IN_FLIGHT: int = 32
+    MAX_WAITING: int = 64
 
-    # Hard timeout for one upstream call; without it a hung provider hangs the request
-    PROVIDER_TIMEOUT_SECONDS: float = 60.0
+    PROVIDER_TIMEOUT_SECONDS: float = 30.0
 
     CACHE_SIMILARITY_THRESHOLD: float = 0.90
     CACHE_MAX_SIZE: int = 100
 
     APP_NAME: str = "LLM Gateway"
-    VERSION: str = "1.0.0"
+    VERSION: str = "2.0.0"
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    @property
+    def api_keys(self) -> set[str]:
+        return {k.strip() for k in self.GATEWAY_API_KEYS.replace(";", ",").split(",") if k.strip()}
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()] or ["*"]
 
 
 @lru_cache()

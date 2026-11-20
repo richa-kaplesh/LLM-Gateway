@@ -1,5 +1,5 @@
 from app.models.schemas import GatewayResponse, CostSummary
-from app.core.db import get_pool
+from app.core.db import get_pool, has_pool
 from app.router.attempt_log import AttemptLog
 import logging
 log = logging.getLogger(__name__)
@@ -18,6 +18,8 @@ class CostTracker:
         # embed_latency_ms defaults to 0.0 when no embedding call happened
         # (no cache scope, or the request errored). Store NULL in that case,
         # so averages are not dragged down by fake zeros.
+        if not has_pool():
+            return
         embedded = bool(response and response.embed_latency_ms)
 
         row = {
@@ -55,7 +57,7 @@ class CostTracker:
         placeholders = ", ".join(f"${i}" for i in range(1, len(row) + 1))
         attempt_rows = [
             (request_id, a.attempt_no, a.deployment_id, a.provider, a.model,
-             a.outcome, a.error_type, a.latency_ms, a.retry_after_s)
+             a.outcome, a.error_type, a.latency_ms, a.retry_after_s, a.error_detail)
             for a in (attempts.attempts if attempts else [])
         ] if self.attempt_columns and request_id else []
 
@@ -66,13 +68,15 @@ class CostTracker:
                 await conn.executemany(
                     """INSERT INTO attempt_logs
                        (request_id, attempt_no, deployment_id, provider, model,
-                        outcome, error_type, latency_ms, retry_after_s)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+                        outcome, error_type, latency_ms, retry_after_s, error_detail)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
                     attempt_rows,
                 )
 
     async def log_breaker_transition(self, provider: str, old_state: str, new_state: str) -> None:
         log.warning("circuit breaker %s: %s -> %s", provider, old_state, new_state)
+        if not has_pool():
+            return
         pool = get_pool()
         await pool.execute(
             "INSERT INTO breaker_events (provider, old_state, new_state) VALUES ($1,$2,$3)",

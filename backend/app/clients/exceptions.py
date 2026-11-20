@@ -1,130 +1,89 @@
-class ProviderUnavailableError(Exception):
-    """Server-side failure from THIS provider (5xx, auth/config error, bad
-    model name). The provider itself is the problem — do NOT fall back and do
-    NOT rotate keys. Return an error immediately."""
-    pass
+class ProviderError(Exception):
+    def __init__(self, message: str = "", retry_after: float | None = None, rate_limit=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.rate_limit = rate_limit
 
 
-class ProviderKeyError(ProviderUnavailableError):
-    """THIS API KEY can't be used: rejected (401/403, 'API key not valid') or no access
-    to the configured model. The provider itself is fine and its other keys may work,
-    so the router disables just this key for a while and tries the next one. Only when
-    every key of a provider is rejected does that provider count as unusable."""
+class ProviderUnavailableError(ProviderError):
     pass
 
 
 class ProviderConnectionError(ProviderUnavailableError):
-    """Network-level failure: DNS resolution failed, TCP connection refused,
-    or request timed out before the provider responded.  The provider itself
-    may be perfectly healthy — this is a transient routing/network problem.
-    Safe to fall back to the other provider for this request."""
     pass
 
 
-class ProviderDownError(Exception):
-    """Unrecoverable failure from a provider: 5xx server error or auth/config
-    problem (bad key, wrong model name).  The provider is broken for this
-    request. Do NOT rotate keys or fall back — return an error immediately
-    that names the provider and includes the underlying cause.
-
-    Connection errors use ProviderConnectionError instead, which allows the
-    router to try the other provider (the network may be fine on that side)."""
-    def __init__(self, provider: str, cause: Exception):
-        self.provider = provider
-        self.cause = cause
-        super().__init__(f"Provider {provider!r} is down: {cause}")
+class ProviderOverloadedError(ProviderUnavailableError):
+    pass
 
 
-class ProviderRateLimitedError(Exception):
-    """THIS provider answered 'slow down' (HTTP 429). The provider is alive, so
-    this must NOT count as an outage for the circuit breaker, and retrying the
-    same provider immediately is pointless. retry_after is in seconds, if the
-    provider told us."""
+class ProviderKeyError(ProviderError):
+    pass
+
+
+class ProviderRateLimitedError(ProviderError):
+    pass
+
+
+class QuotaExhaustedError(ProviderRateLimitedError):
+    pass
+
+
+class InvalidToolCallError(ProviderError):
+    pass
+
+
+class LocalCapacityError(Exception):
     def __init__(self, message: str = "", retry_after: float | None = None):
         super().__init__(message)
         self.retry_after = retry_after
 
 
-class LocalCapacityError(ProviderRateLimitedError):
-    """OUR OWN RPM/TPM budget for this provider is spent. The provider never said 429 and no
-    key is at fault, so keys must NOT be put on cooldown. The budget is per provider, not per
-    key, so trying another key of the same provider cannot help either. retry_after is how long
-    until the local bucket refills enough (None = this request can never fit the budget)."""
-    pass
-
-
 class CircuitOpenError(Exception):
-    """We skipped a provider without calling it because its breaker is open
-    (or a half-open probe is already in flight)."""
     def __init__(self, message: str = "", retry_after: float | None = None):
         super().__init__(message)
         self.retry_after = retry_after
 
 
 class InvalidRequestError(Exception):
-    """The request itself is malformed and will fail against any provider.
-    Don't waste a second API call retrying elsewhere."""
     pass
 
 
 class TooLongError(Exception):
-    """The prompt structurally cannot fit within any configured provider's
-    token limit, even with no other traffic. Retrying won't help — the
-    request needs to be shortened."""
     pass
 
 
-class AllProvidersRateLimitedError(Exception):
-    """Every provider is currently out of RPM/TPM capacity (or answered 429).
-    Temporary — safe and correct for the caller to retry after retry_after seconds."""
-    def __init__(self, message: str = "", retry_after: float | None = None):
+class GatewayRejection(Exception):
+    status_code = 503
+    code = "provider_unavailable"
+
+    def __init__(self, message: str = "", retry_after: float | None = None,
+                 attempts: list[dict] | None = None):
         super().__init__(message)
         self.retry_after = retry_after
+        self.attempts = attempts or []
 
 
-class AllProvidersUnavailableError(Exception):
-    """No provider could serve the request and it was not (only) a rate limit:
-    circuits open, upstream errors, bad config. Maps to HTTP 503, not 500 —
-    this is a dependency problem, not a bug in the gateway."""
-    def __init__(self, message: str = "", retry_after: float | None = None):
-        super().__init__(message)
-        self.retry_after = retry_after
+class AllProvidersRateLimitedError(GatewayRejection):
+    status_code = 429
+    code = "rate_limited"
 
 
-# ── Error classifier ──────────────────────────────────────────────────────────
+class AllQuotaExhaustedError(GatewayRejection):
+    status_code = 429
+    code = "quota_exhausted"
 
-def classify_error(e: Exception) -> str:
-    """Classify a provider exception into one of three routing decisions.
 
-    Returns
-    -------
-    'rate_limit'
-        HTTP 429 / quota exceeded.  Put the key on cooldown and rotate to
-        the next available key / provider.
-    'transient'
-        Network-level failure (DNS, TCP, timeout).  The provider itself may
-        be fine. Try the other provider for this request; do NOT put the key
-        on cooldown.
-    'provider_down'
-        Server-side failure (5xx) or auth/config error (401/403/wrong model).
-        The provider is broken. Stop immediately — no rotation, no fallback.
+class AllProvidersUnavailableError(GatewayRejection):
+    status_code = 503
+    code = "provider_unavailable"
 
-    This is the single authoritative place that encodes the retry policy so
-    callers and tests don't have to inspect raw exception types or HTTP codes.
-    """
-    if isinstance(e, ProviderRateLimitedError):
-        return "rate_limit"
-    if isinstance(e, CircuitOpenError):
-        # The breaker paused a provider after repeated 429s — treat as rate-limit
-        # so the caller rotates to another key/provider instead of stopping.
-        return "rate_limit"
-    if isinstance(e, ProviderKeyError):
-        # This key was rejected. Skip the key (not the provider) and try the next one.
-        return "bad_key"
-    if isinstance(e, ProviderConnectionError):
-        # Network-level failure: the provider may be fine, the network isn't.
-        # Try the other provider; don't penalise this key.
-        return "transient"
-    # ProviderUnavailableError (5xx, bad key, wrong model) and anything else:
-    # the provider itself is the problem — stop immediately.
-    return "provider_down"
+
+class AllInvalidToolCallsError(GatewayRejection):
+    status_code = 502
+    code = "invalid_tool_call"
+
+
+class GatewayOverloadedError(GatewayRejection):
+    status_code = 429
+    code = "overloaded"

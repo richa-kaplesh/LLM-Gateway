@@ -1,75 +1,86 @@
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from app.models.schemas import GatewayRequest, GatewayResponse, CostSummary, HealthCheck
-from app.router.router import route, estimate_request_tokens
-from app.tracker.tracker import tracker
-from app.tracker import metrics as metrics_store
-from pydantic import BaseModel
-from app.core.config import get_settings
-from app.core.db import init_pool, close_pool
-from app.cache.cache import close_http
-from app.clients.adapters import close_adapters
-from app.core.registry import get_deployments
-from app.experiments.schema import ExperimentRun
-from app.experiments.store import load_runs, save_run
-from app.router import attempt_log
-from app.router.status import gateway_status
-import logging
-from app.clients.exceptions import (
-    InvalidRequestError, TooLongError, AllProvidersRateLimitedError, AllProvidersUnavailableError,
-)
 import asyncio
+import hmac
+import logging
 import math
 import time
 import uuid
-from app.core.logging_setup import setup_logging, request_id_var
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from app.cache.cache import close_http
+from app.clients.adapters import close_adapters
+from app.clients.exceptions import GatewayRejection, InvalidRequestError, TooLongError
+from app.core.config import get_settings
+from app.core.db import close_pool, has_pool, init_pool
+from app.core.logging_setup import request_id_var, setup_logging
+from app.core.registry import get_deployments
+from app.experiments.schema import ExperimentRun
+from app.experiments.store import load_runs, save_run
+from app.models.schemas import CostSummary, GatewayRequest, GatewayResponse
+from app.router import attempt_log
+from app.router.router import estimate_request_tokens, route
+from app.router.status import gateway_status
+from app.state.store import close_store, get_store, init_store
+from app.tracker import metrics as metrics_store
+from app.tracker.tracker import tracker
 
 setup_logging()
 
-# uvicorn puts its own plain-text handlers on these loggers, which would break
-# "every line is JSON". Route them through our root handler instead.
 for _name in ("uvicorn", "uvicorn.error"):
     _lg = logging.getLogger(_name)
     _lg.handlers.clear()
     _lg.propagate = True
-logging.getLogger("uvicorn.access").disabled = True   # the middleware below logs every request
-logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs every outbound call at INFO
+logging.getLogger("uvicorn.access").disabled = True
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 http_log = logging.getLogger("gateway.http")
 
 settings = get_settings()
+DB_TIMEOUT_SECONDS = 2.0
+MAX_HISTORY_ROWS = 1000
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     deployments = get_deployments()
     log.info("registry loaded: %d enabled deployments: %s", len(deployments), [d.id for d in deployments])
-    await init_pool()
-    try:
-        await metrics_store.ensure_tables()
-    except Exception as e:   # best-effort: the gateway must still serve requests
-        log.warning("could not ensure metric_snapshots table: %s: %s", type(e).__name__, e)
+    await init_store(settings.REDIS_URL)
+    if await init_pool():
+        try:
+            await metrics_store.ensure_tables()
+        except Exception as e:
+            log.warning("could not ensure metrics tables: %s: %s", type(e).__name__, e)
+    else:
+        log.warning("DATABASE_URL is empty: request history and metrics are disabled")
+    if not settings.api_keys:
+        log.warning("GATEWAY_API_KEYS is empty: POST endpoints are open to anyone")
     yield
     await close_adapters()
     await close_http()
     await close_pool()
+    await close_store()
 
 
 app = FastAPI(title=settings.APP_NAME, version=settings.VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
+
 
 @app.middleware("http")
 async def request_context(request: Request, call_next):
@@ -93,17 +104,32 @@ async def request_context(request: Request, call_next):
         request_id_var.reset(token)
 
 
-@app.get("/health", response_model=HealthCheck)
-async def health_check():
-    return HealthCheck(status="ok", deployments=[d.id for d in get_deployments()])
+def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    keys = settings.api_keys
+    if not keys:
+        return
+    if x_api_key is None or not any(hmac.compare_digest(x_api_key, k) for k in keys):
+        raise HTTPException(status_code=401, detail="missing or invalid X-API-Key",
+                            headers={"WWW-Authenticate": "ApiKey"})
 
 
-DB_TIMEOUT_SECONDS = 2.0
+def _retry_headers(retry_after: float | None) -> dict | None:
+    if retry_after is None:
+        return None
+    return {"Retry-After": str(max(1, math.ceil(retry_after)))}
+
+
+def _error_response(status: int, code: str, message: str, retry_after: float | None = None,
+                    attempts: list[dict] | None = None) -> JSONResponse:
+    body = {"detail": message,
+            "error": {"code": code, "message": message,
+                      "retry_after_s": round(retry_after, 1) if retry_after is not None else None,
+                      "request_id": request_id_var.get(),
+                      "attempts": attempts or []}}
+    return JSONResponse(status_code=status, content=body, headers=_retry_headers(retry_after))
 
 
 async def _track(request: GatewayRequest, response, status: str, error_type: str | None = None) -> None:
-    """Best-effort request logging. A database problem (Neon suspended, connection
-    reset) must never turn a good answer into a 500, or hang the response."""
     try:
         await asyncio.wait_for(
             tracker.log(
@@ -118,52 +144,47 @@ async def _track(request: GatewayRequest, response, status: str, error_type: str
         log.warning("could not persist request log: %s: %s", type(e).__name__, e)
 
 
-def _retry_headers(retry_after: float | None) -> dict | None:
-    if retry_after is None:
-        return None
-    return {"Retry-After": str(max(1, math.ceil(retry_after)))}
+@app.get("/health")
+async def health_check():
+    try:
+        store_ok = await asyncio.wait_for(get_store().ping(), 2.0)
+    except Exception:
+        store_ok = False
+    return {"status": "ok" if store_ok else "degraded",
+            "deployments": [d.id for d in get_deployments()],
+            "state_store": {"backend": get_store().backend, "ok": store_ok},
+            "database": has_pool(),
+            "auth": bool(settings.api_keys)}
 
 
-@app.post("/query", response_model=GatewayResponse)
+@app.post("/query", response_model=GatewayResponse, dependencies=[Depends(require_api_key)])
 async def handle_query(request: GatewayRequest):
-    attempt_log.start()
+    attempts = attempt_log.start()
     try:
         response = await route(request)
     except InvalidRequestError as e:
         log.info("/query rejected (invalid request): %s", e)
         await _track(request, None, "error", "InvalidRequestError")
-        raise HTTPException(status_code=400, detail=str(e))
-
+        return _error_response(400, "invalid_request", str(e), attempts=attempts.public())
     except TooLongError as e:
         log.info("/query rejected (too long): %s", e)
         await _track(request, None, "error", "TooLongError")
-        raise HTTPException(status_code=413, detail=str(e))
-
-    except AllProvidersRateLimitedError as e:
-        log.warning("/query rejected (all providers rate-limited): %s", e)
-        await _track(request, None, "error", "AllProvidersRateLimitedError")
-        raise HTTPException(status_code=429, detail=str(e), headers=_retry_headers(e.retry_after))
-
-    except AllProvidersUnavailableError as e:
-        # a dependency problem, not a gateway bug: 503, one log line, no traceback
-        log.error("/query failed (no provider available): %s", e)
-        await _track(request, None, "error", "AllProvidersUnavailableError")
-        raise HTTPException(status_code=503, detail=str(e), headers=_retry_headers(e.retry_after))
-
+        return _error_response(413, "too_long", str(e))
+    except GatewayRejection as e:
+        log.warning("/query rejected (%s): %s", e.code, e)
+        await _track(request, None, "error", type(e).__name__)
+        return _error_response(e.status_code, e.code, str(e), e.retry_after, e.attempts)
     except Exception as e:
         log.error("/query failed: %s", e, exc_info=True)
         await _track(request, None, "error", type(e).__name__)
-        raise HTTPException(status_code=500, detail=str(e))
+        return _error_response(500, "internal_error", f"{type(e).__name__}: {e}")
 
-    # FastAPI serializes the return value AFTER this function returns, outside every
-    # try/except here, so a non-JSON value would become a bare 500 while the request is
-    # still logged as a success. Serialize now so that failure is caught and tracked.
     try:
         response.model_dump(mode="json")
     except Exception as e:
         log.error("/query response is not JSON-serializable: %s: %s", type(e).__name__, e, exc_info=True)
         await _track(request, None, "error", "ResponseSerializationError")
-        raise HTTPException(status_code=500, detail="Gateway produced a response that could not be serialized")
+        return _error_response(500, "internal_error", "Gateway produced a response that could not be serialized")
 
     log.info("/query ok: provider=%s model=%s fallback=%s cache_hit=%s latency_ms=%.0f cost_usd=%.6f",
              response.provider_used, response.model_used, response.was_fallback,
@@ -172,12 +193,17 @@ async def handle_query(request: GatewayRequest):
     return response
 
 
-@app.get("/stats/global")
+def _require_db() -> None:
+    if not has_pool():
+        raise HTTPException(status_code=503, detail="database is not configured")
+
+
+@app.get("/stats/global", dependencies=[Depends(_require_db)])
 async def global_stats():
     return await tracker.get_global_stats()
 
 
-@app.get("/stats/user/{user_id}", response_model=CostSummary)
+@app.get("/stats/user/{user_id}", response_model=CostSummary, dependencies=[Depends(_require_db)])
 async def user_stats(user_id: str):
     stats = await tracker.get_user_stats(user_id)
     if stats is None:
@@ -185,8 +211,8 @@ async def user_stats(user_id: str):
     return stats
 
 
-@app.get("/stats/requests")
-async def request_history(limit: int = 200):
+@app.get("/stats/requests", dependencies=[Depends(_require_db)])
+async def request_history(limit: int = Query(default=200, ge=1, le=MAX_HISTORY_ROWS)):
     return await tracker.get_recent_requests(limit)
 
 
@@ -195,17 +221,15 @@ async def get_experiments():
     return load_runs()
 
 
-@app.post("/experiments")
+@app.post("/experiments", dependencies=[Depends(require_api_key)])
 async def log_experiment(run: ExperimentRun):
     return save_run(run)
 
 
 @app.get("/status")
 async def status():
-    return gateway_status(get_deployments())
+    return await gateway_status(get_deployments())
 
-
-# ── Baseline metrics (computed from request_logs / breaker_events) ─────────────
 
 def _parse_window(since: str | None, until: str | None):
     try:
@@ -214,7 +238,7 @@ def _parse_window(since: str | None, until: str | None):
         raise HTTPException(status_code=400, detail="since/until must be ISO 8601 timestamps")
 
 
-@app.get("/metrics/summary")
+@app.get("/metrics/summary", dependencies=[Depends(_require_db)])
 async def metrics_summary(since: str | None = None, until: str | None = None):
     s, u = _parse_window(since, until)
     return await metrics_store.get_metrics_summary(s, u)
@@ -226,12 +250,12 @@ class SnapshotRequest(BaseModel):
     until: str | None = None
 
 
-@app.get("/metrics/snapshots")
+@app.get("/metrics/snapshots", dependencies=[Depends(_require_db)])
 async def metrics_snapshots():
     return await metrics_store.list_snapshots()
 
 
-@app.post("/metrics/snapshots")
+@app.post("/metrics/snapshots", dependencies=[Depends(require_api_key), Depends(_require_db)])
 async def metrics_save_snapshot(body: SnapshotRequest):
     label = body.label.strip()
     if not label:

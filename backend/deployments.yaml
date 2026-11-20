@@ -9,6 +9,7 @@ deployments:
     capabilities: {tools: true, json: true}
     tier: smart
     price: {input: 0.15, output: 0.60, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
 
   - id: groq-2
     provider: groq
@@ -20,6 +21,7 @@ deployments:
     capabilities: {tools: true, json: true}
     tier: smart
     price: {input: 0.15, output: 0.60, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
 
   - id: groq-3
     provider: groq
@@ -31,13 +33,50 @@ deployments:
     capabilities: {tools: true, json: true}
     tier: smart
     price: {input: 0.15, output: 0.60, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
+
+  - id: groq-fast-1
+    provider: groq
+    adapter: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    key_env: GROQ_API_KEY_1
+    model: qwen/qwen3.8-27b
+    limits: {rpm: 30, tpm: 8000, rpd: 1000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: fast
+    price: {input: 0.29, output: 0.59, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
+
+  - id: groq-fast-2
+    provider: groq
+    adapter: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    key_env: GROQ_API_KEY_2
+    model: qwen/qwen3.8-27b
+    limits: {rpm: 30, tpm: 8000, rpd: 1000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: fast
+    price: {input: 0.29, output: 0.59, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
+
+  - id: groq-fast-3
+    provider: groq
+    adapter: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    key_env: GROQ_API_KEY_3
+    model: qwen/qwen3.8-27b
+    limits: {rpm: 30, tpm: 8000, rpd: 1000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: fast
+    price: {input: 0.29, output: 0.59, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
 
   - id: or-1
     provider: openrouter
     adapter: openai_compatible
     base_url: https://openrouter.ai/api/v1
     key_env: OPENROUTER_API_KEY_1
-    model: google/gemma-4-31b-it:free
+    model: nvidia/nemotron-3-ultra-550b-a55b:free
     limits: {rpm: 20, tpm: null, rpd: 50, tpd: null}
     capabilities: {tools: true, json: true}
     tier: smart
@@ -48,10 +87,10 @@ deployments:
     adapter: openai_compatible
     base_url: https://openrouter.ai/api/v1
     key_env: OPENROUTER_API_KEY_2
-    model: google/gemma-4-31b-it:free
+    model: nvidia/nemotron-3.5-lightning:free
     limits: {rpm: 20, tpm: null, rpd: 50, tpd: null}
     capabilities: {tools: true, json: true}
-    tier: smart
+    tier: fast
     price: {input: 0, output: 0, cached_input: null}
 
   - id: gemini-1

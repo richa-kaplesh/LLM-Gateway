@@ -3,10 +3,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from app.clients.exceptions import (
-    CircuitOpenError, InvalidRequestError, LocalCapacityError, ProviderKeyError,
-    ProviderRateLimitedError,
+    CircuitOpenError, InvalidRequestError, InvalidToolCallError, LocalCapacityError,
+    ProviderKeyError, ProviderOverloadedError, ProviderRateLimitedError, QuotaExhaustedError,
 )
 from app.models.deployment import Deployment
+
+ERROR_DETAIL_MAX_CHARS = 300
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,11 @@ class Attempt:
     error_type: str | None
     latency_ms: float | None
     retry_after_s: float | None
+    error_detail: str | None = None
+
+    def public(self) -> dict:
+        return {"deployment_id": self.deployment_id, "provider": self.provider, "model": self.model,
+                "outcome": self.outcome, "retry_after_s": self.retry_after_s}
 
 
 @dataclass
@@ -37,6 +44,7 @@ class AttemptLog:
             error_type=type(error).__name__ if error is not None else None,
             latency_ms=round(latency_ms, 1) if latency_ms is not None else None,
             retry_after_s=getattr(error, "retry_after", None),
+            error_detail=str(error)[:ERROR_DETAIL_MAX_CHARS] if error is not None else None,
         )
         self.attempts.append(attempt)
         return attempt
@@ -50,12 +58,17 @@ class AttemptLog:
         last = self.attempts[-1] if self.attempts else None
         return last.deployment_id if last and last.outcome == "success" else None
 
+    def public(self) -> list[dict]:
+        return [a.public() for a in self.attempts]
+
 
 def outcome_for(error: BaseException | None) -> str:
     if error is None:
         return "success"
     if isinstance(error, LocalCapacityError):
         return "local_capacity"
+    if isinstance(error, QuotaExhaustedError):
+        return "quota_exhausted"
     if isinstance(error, ProviderRateLimitedError):
         return "rate_limited"
     if isinstance(error, CircuitOpenError):
@@ -64,9 +77,13 @@ def outcome_for(error: BaseException | None) -> str:
         return "bad_key"
     if isinstance(error, InvalidRequestError):
         return "bad_request"
+    if isinstance(error, InvalidToolCallError):
+        return "invalid_tool_call"
+    if isinstance(error, ProviderOverloadedError):
+        return "overloaded"
     if isinstance(error, asyncio.CancelledError):
         return "cancelled"
-    return "failed"
+    return "down"
 
 
 _current: ContextVar[AttemptLog | None] = ContextVar("attempt_log", default=None)

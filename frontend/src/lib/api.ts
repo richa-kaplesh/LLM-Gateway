@@ -1,5 +1,40 @@
 const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
+const API_KEY_STORAGE = 'gatewayApiKey'
+
+function readApiKey(): string | null {
+  try {
+    return window.localStorage.getItem(API_KEY_STORAGE)
+  } catch {
+    return null
+  }
+}
+
+function storeApiKey(key: string | null) {
+  try {
+    if (key) window.localStorage.setItem(API_KEY_STORAGE, key)
+    else window.localStorage.removeItem(API_KEY_STORAGE)
+  } catch {
+    return
+  }
+}
+
+async function postWithKey(path: string, body: unknown): Promise<Response> {
+  const send = (key: string | null) =>
+    fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(key ? { 'X-API-Key': key } : {}) },
+      body: JSON.stringify(body),
+    })
+  const res = await send(readApiKey())
+  if (res.status !== 401) return res
+  const entered = window.prompt('This gateway needs an API key for write requests. Enter X-API-Key:')
+  if (!entered) return res
+  const retry = await send(entered.trim())
+  storeApiKey(retry.status === 401 ? null : entered.trim())
+  return retry
+}
+
 // ── Query ─────────────────────────────────────────────────────────────────────
 
 export interface GatewayMessage {
@@ -36,11 +71,7 @@ export interface QueryResponse {
 }
 
 export async function postQuery(payload: QueryRequest): Promise<QueryResponse> {
-  const res = await fetch(`${API_BASE}/query`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  })
+  const res = await postWithKey('/query', payload)
 
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText)
@@ -163,17 +194,21 @@ export interface DeploymentStatus {
   verdict: Verdict
   ready_in_s: number | null
   meters: Partial<Record<'rpm' | 'tpm' | 'rpd' | 'tpd', Meter>>
-  cooldown: { cooldown_remaining_s: number; bad_key: boolean }
+  score?: number
+  cooldown: { cooldown_remaining_s: number; bad_key: boolean; reason?: string | null; streak?: number }
   breaker: {
     group: string
     state: BreakerState
     consecutive_failures: number
-    paused_for_seconds: number
+    trips?: number
     retry_in_seconds: number
   }
+  health?: { penalty: number; latency_ewma_ms: number | null }
 }
 
 export interface GatewayStatus {
+  state_store?: 'memory' | 'redis'
+  admission?: { in_flight: number; waiting: number; shed_total: number; max_in_flight: number; max_waiting: number }
   deployments_total: number
   deployments_ready: number
   by_verdict: Partial<Record<Verdict, number>>
@@ -409,11 +444,7 @@ export async function saveMetricsSnapshot(
   since?: string,
   until?: string
 ): Promise<MetricsSnapshot> {
-  const res = await fetch(`${API_BASE}/metrics/snapshots`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ label, since, until }),
-  })
+  const res = await postWithKey('/metrics/snapshots', { label, since, until })
 
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText)

@@ -1,7 +1,10 @@
 import base64
-from pydantic import BaseModel, field_serializer
-from typing import Any, Optional
-from enum import Enum
+from typing import Any, Literal, Optional
+
+from pydantic import BaseModel, Field, field_serializer, field_validator
+
+MESSAGE_ROLES = {"system", "user", "assistant", "tool", "developer"}
+MAX_MESSAGES = 500
 
 
 def _jsonable(obj: Any) -> Any:
@@ -25,7 +28,23 @@ class GatewayRequest(BaseModel):
     tool_choice: Optional[str] = None
     stream: bool = False
     is_tool_related: bool = False
-    cache_scope: Optional[str] = None   # "conversation" | "global" | None
+    cache_scope: Optional[Literal["conversation", "global"]] = None
+    tier: Optional[Literal["smart", "fast"]] = None
+
+    @field_validator("messages")
+    @classmethod
+    def _valid_messages(cls, messages: list[dict]) -> list[dict]:
+        if not messages:
+            raise ValueError("messages must not be empty")
+        if len(messages) > MAX_MESSAGES:
+            raise ValueError(f"at most {MAX_MESSAGES} messages are allowed")
+        for i, m in enumerate(messages):
+            if m.get("role") not in MESSAGE_ROLES:
+                raise ValueError(f"messages[{i}].role must be one of {sorted(MESSAGE_ROLES)}")
+            content = m.get("content")
+            if content is not None and not isinstance(content, (str, list)):
+                raise ValueError(f"messages[{i}].content must be a string, a list of parts, or null")
+        return messages
 
 
 class GatewayResponse(BaseModel):
@@ -35,6 +54,7 @@ class GatewayResponse(BaseModel):
     model_used: str
     provider_used: str
     deployment_id: Optional[str] = None
+    tier: Optional[str] = None
     attempts: int = 1
     cost_usd: float
     latency_ms: float
@@ -48,6 +68,7 @@ class GatewayResponse(BaseModel):
     thought_tokens: Optional[int] = None   # the thinking part of output_tokens (Gemini)
     cached_tokens: Optional[int] = None    # prompt tokens served from the provider's prompt cache
     price_known: bool = True               # False when the model has no entry in the rate card
+    rate_limit: Optional[dict] = Field(default=None, exclude=True)
 
     @field_serializer("tool_calls")
     def _serialize_tool_calls(self, value: Optional[list[dict]]):

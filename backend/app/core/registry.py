@@ -113,7 +113,12 @@ def _process_env() -> dict[str, str]:
 
 @lru_cache()
 def get_deployments() -> tuple[Deployment, ...]:
-    deployments = load_deployments(DEPLOYMENTS_FILE, _process_env())
+    env = _process_env()
+    override = env.get("DEPLOYMENTS_FILE")
+    path = Path(override) if override else DEPLOYMENTS_FILE
+    if not path.is_absolute():
+        path = BACKEND_DIR / path
+    deployments = load_deployments(path, env)
     for d in deployments:
         log.info("deployment loaded: id=%s provider=%s model=%s limits=%s",
                  d.id, d.provider, d.model, d.limits.model_dump())

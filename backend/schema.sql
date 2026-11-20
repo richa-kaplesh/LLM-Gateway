@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS attempt_logs (
 CREATE INDEX IF NOT EXISTS attempt_logs_timestamp_idx ON attempt_logs (timestamp);
 CREATE INDEX IF NOT EXISTS attempt_logs_deployment_time_idx ON attempt_logs (deployment_id, timestamp);
 CREATE INDEX IF NOT EXISTS attempt_logs_request_id_idx ON attempt_logs (request_id);
+ALTER TABLE attempt_logs ADD COLUMN IF NOT EXISTS error_detail TEXT;
 
 CREATE TABLE IF NOT EXISTS breaker_events (
     id         BIGSERIAL PRIMARY KEY,

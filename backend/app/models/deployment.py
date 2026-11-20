@@ -43,6 +43,7 @@ class DeploymentSpec(_Strict):
     capabilities: Capabilities
     tier: Literal["smart", "fast"]
     price: Price
+    rate_limit_headers: Optional[dict[str, Literal["rpm", "tpm", "rpd", "tpd"]]] = None
 
     @model_validator(mode="after")
     def _openai_compatible_needs_base_url(self):

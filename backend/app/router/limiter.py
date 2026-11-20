@@ -1,173 +1,100 @@
-import time
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from app.models.deployment import Deployment, Limits
+from app.state.meter_logic import BUCKET, DAY, SECONDS_PER_MINUTE, Demand, MeterResult
+from app.state.store import KEY_PREFIX, get_store
 
-SECONDS_PER_MINUTE = 60
-SECONDS_PER_DAY = 86_400
-
-
-class TokenBucket:
-    def __init__(self, capacity: float, refill_per_second: float):
-        self.capacity = capacity
-        self.refill_per_second = refill_per_second
-        self.tokens = capacity
-        self._last_refill = time.monotonic()
-
-    def _refill(self) -> None:
-        now = time.monotonic()
-        self.tokens = min(self.capacity, self.tokens + (now - self._last_refill) * self.refill_per_second)
-        self._last_refill = now
-
-    def can_consume(self, amount: float) -> bool:
-        self._refill()
-        return self.tokens >= amount
-
-    def seconds_until(self, amount: float) -> float | None:
-        self._refill()
-        if amount > self.capacity:
-            return None
-        return max(0.0, (amount - self.tokens) / self.refill_per_second)
-
-    def consume(self, amount: float):
-        self.tokens -= amount
-        return amount
-
-    def refund(self, receipt) -> None:
-        self._refill()
-        self.tokens = min(self.capacity, self.tokens + receipt)
-
-    def used(self) -> float:
-        self._refill()
-        return self.capacity - self.tokens
-
-    def snapshot(self) -> dict:
-        used = self.used()
-        return {"limit": self.capacity, "used": round(used, 1),
-                "full_in_s": round(used / self.refill_per_second, 1)}
-
-
-class RollingWindow:
-    def __init__(self, limit: int, window_seconds: float):
-        self.limit = limit
-        self.window_seconds = window_seconds
-        self._entries: deque[list[float]] = deque()
-        self._total = 0.0
-
-    def _expire(self) -> None:
-        cutoff = time.monotonic() - self.window_seconds
-        while self._entries and self._entries[0][0] <= cutoff:
-            self._total -= self._entries.popleft()[1]
-
-    def can_consume(self, amount: float) -> bool:
-        self._expire()
-        return self._total + amount <= self.limit
-
-    def seconds_until(self, amount: float) -> float | None:
-        self._expire()
-        if amount > self.limit:
-            return None
-        excess = self._total + amount - self.limit
-        if excess <= 0:
-            return 0.0
-        freed = 0.0
-        now = time.monotonic()
-        for started_at, entry_amount in self._entries:
-            freed += entry_amount
-            if freed >= excess:
-                return max(0.0, started_at + self.window_seconds - now)
-        return None
-
-    def consume(self, amount: float):
-        entry = [time.monotonic(), amount]
-        self._entries.append(entry)
-        self._total += amount
-        return entry
-
-    def refund(self, receipt) -> None:
-        try:
-            self._entries.remove(receipt)
-        except ValueError:
-            return
-        self._total -= receipt[1]
-
-    def used(self) -> float:
-        self._expire()
-        return self._total
-
-    def snapshot(self) -> dict:
-        used = self.used()
-        next_free = None
-        if self._entries:
-            next_free = round(max(0.0, self._entries[0][0] + self.window_seconds - time.monotonic()), 1)
-        return {"limit": self.limit, "used": round(used, 1), "next_free_in_s": next_free}
+METER_KINDS = {"rpm": BUCKET, "tpm": BUCKET, "rpd": DAY, "tpd": DAY}
+REQUEST_METERS = ("rpm", "rpd")
+DAY_METERS = ("rpd", "tpd")
+MINUTE_METERS = ("rpm", "tpm")
 
 
 @dataclass
 class Reservation:
-    receipts: list = field(default_factory=list)
+    deployment_id: str
+    slot: int
+    demands: list[Demand]
+    released: bool = False
 
 
-class DeploymentLimiter:
-    def __init__(self, limits: Limits):
-        self._request_meters = []
-        self._token_meters = []
-        if limits.rpm:
-            self._request_meters.append(("rpm", TokenBucket(limits.rpm, limits.rpm / SECONDS_PER_MINUTE)))
-        if limits.rpd:
-            self._request_meters.append(("rpd", RollingWindow(limits.rpd, SECONDS_PER_DAY)))
-        if limits.tpm:
-            self._token_meters.append(("tpm", TokenBucket(limits.tpm, limits.tpm / SECONDS_PER_MINUTE)))
-        if limits.tpd:
-            self._token_meters.append(("tpd", RollingWindow(limits.tpd, SECONDS_PER_DAY)))
-
-    def _demands(self, tokens: int):
-        return ([(name, meter, 1) for name, meter in self._request_meters]
-                + [(name, meter, tokens) for name, meter in self._token_meters])
-
-    def can_ever_fit(self, tokens: int) -> bool:
-        return all(meter.seconds_until(amount) is not None for _, meter, amount in self._demands(tokens))
-
-    def fits(self, tokens: int) -> bool:
-        return all(meter.can_consume(amount) for _, meter, amount in self._demands(tokens))
-
-    def seconds_until_fits(self, tokens: int) -> float | None:
-        waits = [meter.seconds_until(amount) for _, meter, amount in self._demands(tokens)]
-        if None in waits:
-            return None
-        return max(waits, default=0.0)
-
-    def reserve(self, tokens: int) -> Reservation | None:
-        if not self.fits(tokens):
-            return None
-        return Reservation([(meter, meter.consume(amount)) for _, meter, amount in self._demands(tokens)])
-
-    def release(self, reservation: Reservation) -> None:
-        for meter, receipt in reservation.receipts:
-            meter.refund(receipt)
-        reservation.receipts.clear()
-
-    def snapshot(self) -> dict[str, dict]:
-        meters = {}
-        for name, meter, _ in self._demands(0):
-            state = meter.snapshot()
-            state["remaining"] = round(max(0.0, state["limit"] - state["used"]), 1)
-            state["utilisation_pct"] = round(100 * state["used"] / state["limit"], 1)
-            meters[name] = state
-        return meters
+def meter_key(deployment_id: str) -> str:
+    return f"{KEY_PREFIX}m:{deployment_id}"
 
 
-_limiters: dict[str, DeploymentLimiter] = {}
+def demands_for(limits: Limits, tokens: int) -> list[Demand]:
+    demands = []
+    for name, kind in METER_KINDS.items():
+        limit = getattr(limits, name)
+        if limit:
+            demands.append(Demand(name, kind, limit, 1 if name in REQUEST_METERS else tokens))
+    return demands
 
 
-def limiter_for(deployment: Deployment) -> DeploymentLimiter:
-    limiter = _limiters.get(deployment.id)
-    if limiter is None:
-        limiter = DeploymentLimiter(deployment.limits)
-        _limiters[deployment.id] = limiter
-    return limiter
+def can_ever_fit(limits: Limits, tokens: int, day_fraction: float = 1.0) -> bool:
+    for d in demands_for(limits, tokens):
+        ceiling = d.limit * day_fraction if d.kind == DAY else d.limit
+        if d.amount > ceiling:
+            return False
+    return True
 
 
-def reset_limiters() -> None:
-    _limiters.clear()
+async def reserve(deployment: Deployment, tokens: int, day_fraction: float) -> tuple[Reservation | None, MeterResult]:
+    demands = demands_for(deployment.limits, tokens)
+    result = await get_store().meter(meter_key(deployment.id), demands, day_fraction, reserve=True)
+    if not result.ok:
+        return None, result
+    return Reservation(deployment.id, result.slot, demands), result
+
+
+async def release(reservation: Reservation | None) -> None:
+    if reservation is None or reservation.released:
+        return
+    reservation.released = True
+    await get_store().meter_release(meter_key(reservation.deployment_id), reservation.slot, reservation.demands)
+
+
+async def peek_many(deployments: list[Deployment], tokens: int, day_fraction: float) -> list[MeterResult]:
+    items = [(meter_key(d.id), demands_for(d.limits, tokens), day_fraction) for d in deployments]
+    return await get_store().meter_many(items)
+
+
+async def apply_rate_limit(deployment: Deployment, info: dict[str, tuple[float, float]] | None) -> None:
+    if not info:
+        return
+    store = get_store()
+    for name, (remaining, reset_in) in info.items():
+        if getattr(deployment.limits, name, None) and reset_in > 0:
+            await store.meter_override(meter_key(deployment.id), name, remaining, reset_in)
+
+
+async def drain_minute_meters(deployment: Deployment) -> None:
+    names = [n for n in MINUTE_METERS if getattr(deployment.limits, n)]
+    await get_store().meter_drain(meter_key(deployment.id), names)
+
+
+def blocked_by_day(result: MeterResult) -> bool:
+    return any(result.readings[n].wait_s != 0 for n in DAY_METERS if n in result.readings)
+
+
+def blocked_by_minute(result: MeterResult) -> bool:
+    return any(result.readings[n].wait_s != 0 for n in MINUTE_METERS if n in result.readings)
+
+
+def headroom(result: MeterResult) -> float:
+    names = [n for n in DAY_METERS if n in result.readings] or list(result.readings)
+    fractions = [result.readings[n].remaining / result.readings[n].limit for n in names]
+    return min(fractions, default=1.0)
+
+
+def snapshot(result: MeterResult) -> dict[str, dict]:
+    meters = {}
+    for name, r in result.readings.items():
+        state = {"limit": r.limit, "used": round(r.used, 1), "remaining": round(r.remaining, 1),
+                 "utilisation_pct": round(100 * r.used / r.limit, 1) if r.limit else 0.0}
+        if METER_KINDS[name] == BUCKET:
+            state["full_in_s"] = round(r.used / (r.limit / SECONDS_PER_MINUTE), 1)
+        else:
+            state["next_free_in_s"] = None if r.used <= 0 else round(r.wait_s, 1) if r.wait_s else None
+        meters[name] = state
+    return meters

@@ -1,0 +1,48 @@
+deployments:
+  - id: mock-1
+    provider: mock
+    adapter: openai_compatible
+    base_url: http://127.0.0.1:9100/v1
+    key_env: MOCK_API_KEY_1
+    model: mock-smart
+    limits: {rpm: 60, tpm: 30000, rpd: 5000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0, output: 0, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
+
+  - id: mock-2
+    provider: mock
+    adapter: openai_compatible
+    base_url: http://127.0.0.1:9100/v1
+    key_env: MOCK_API_KEY_2
+    model: mock-smart
+    limits: {rpm: 60, tpm: 30000, rpd: 5000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0, output: 0, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
+
+  - id: mock-3
+    provider: mock
+    adapter: openai_compatible
+    base_url: http://127.0.0.1:9100/v1
+    key_env: MOCK_API_KEY_3
+    model: mock-smart
+    limits: {rpm: 60, tpm: 30000, rpd: 5000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0, output: 0, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}
+
+  - id: mock-fast-1
+    provider: mock
+    adapter: openai_compatible
+    base_url: http://127.0.0.1:9100/v1
+    key_env: MOCK_API_KEY_1
+    model: mock-fast
+    limits: {rpm: 60, tpm: 30000, rpd: 5000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: fast
+    price: {input: 0, output: 0, cached_input: null}
+    rate_limit_headers: {requests: rpd, tokens: tpm}

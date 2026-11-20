@@ -1,22 +1,19 @@
-from collections import OrderedDict
-
-MAX_TRACKED_CONVERSATIONS = 5000
+from app.state.store import KEY_PREFIX, get_store
 
 ModelGroup = tuple[str, str]
 
-_pins: OrderedDict[str, ModelGroup] = OrderedDict()
+PIN_TTL_SECONDS = 6 * 3600
 
 
-def pinned_group(conversation_id: str) -> ModelGroup | None:
-    return _pins.get(conversation_id)
+def pin_key(conversation_id: str) -> str:
+    return f"{KEY_PREFIX}pin:{conversation_id}"
 
 
-def pin(conversation_id: str, group: ModelGroup) -> None:
-    _pins.pop(conversation_id, None)
-    _pins[conversation_id] = group
-    while len(_pins) > MAX_TRACKED_CONVERSATIONS:
-        _pins.popitem(last=False)
+async def pinned_group(conversation_id: str) -> ModelGroup | None:
+    value = (await get_store().get_json_many([pin_key(conversation_id)]))[0]
+    return (value["provider"], value["model"]) if value else None
 
 
-def reset_pins() -> None:
-    _pins.clear()
+async def pin(conversation_id: str, group: ModelGroup) -> None:
+    provider, model = group
+    await get_store().set_json(pin_key(conversation_id), {"provider": provider, "model": model}, PIN_TTL_SECONDS)

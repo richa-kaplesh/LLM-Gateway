@@ -1,55 +1,59 @@
 from collections import Counter
 
-from app.models.deployment import Deployment
-from app.router import cooldowns
-from app.router.circuit_breaker import breaker_for, group_label
-from app.router.limiter import limiter_for
+from app.router import circuit_breaker, cooldowns, health, limiter, selection
+from app.router.admission import get_admission
+from app.router.selection import Need
+from app.state.store import get_store
 
-REQUEST_METERS = ("rpm", "rpd")
+STATUS_NEED = Need(tokens=0, needs_tools=False, required_group=None, tier=None, priority=True)
 
 
-def _verdict(cooldown: dict, breaker: dict, meters: dict) -> str:
-    if cooldown["bad_key"]:
+def _verdict(view: selection.DeploymentView) -> str:
+    blocker = view.blocker
+    if blocker == selection.BLOCK_BAD_KEY:
         return "bad_key"
-    if breaker["state"] != "closed" or breaker["retry_in_seconds"] > 0:
+    if blocker == selection.BLOCK_BREAKER or circuit_breaker.state_of(view.breaker) != circuit_breaker.CLOSED:
         return "breaker_open"
-    if cooldown["cooldown_remaining_s"] > 0:
+    if blocker == selection.BLOCK_QUOTA:
+        return "exhausted"
+    if view.cooldown_wait > 0:
         return "cooling"
-    if any(meters[name]["remaining"] < 1 for name in REQUEST_METERS if name in meters):
+    if any(view.meters.readings[n].remaining < 1 for n in limiter.REQUEST_METERS if n in view.meters.readings):
         return "exhausted"
     return "ready"
 
 
-def _ready_in_s(deployment: Deployment, cooldown: dict, breaker: dict) -> float | None:
-    limiter_wait = limiter_for(deployment).seconds_until_fits(0)
-    if limiter_wait is None:
+def _ready_in_s(view: selection.DeploymentView) -> float | None:
+    if view.rate_wait is None:
         return None
-    wait = max(limiter_wait, cooldown["cooldown_remaining_s"], breaker["retry_in_seconds"])
-    return round(wait, 1)
+    return round(max(view.rate_wait, view.breaker_wait), 1)
 
 
-def deployment_status(deployment: Deployment) -> dict:
-    meters = limiter_for(deployment).snapshot()
-    cooldown = cooldowns.snapshot(deployment.id)
-    breaker = breaker_for(deployment.model_group).snapshot()
+def deployment_status(view: selection.DeploymentView) -> dict:
+    d = view.deployment
     return {
-        "id": deployment.id,
-        "provider": deployment.provider,
-        "model": deployment.model,
-        "tier": deployment.tier,
-        "verdict": _verdict(cooldown, breaker, meters),
-        "ready_in_s": _ready_in_s(deployment, cooldown, breaker),
-        "meters": meters,
-        "cooldown": cooldown,
-        "breaker": {"group": group_label(deployment.model_group), **breaker},
+        "id": d.id,
+        "provider": d.provider,
+        "model": d.model,
+        "tier": d.tier,
+        "verdict": _verdict(view),
+        "ready_in_s": _ready_in_s(view),
+        "score": round(view.score(None), 3),
+        "meters": limiter.snapshot(view.meters),
+        "cooldown": cooldowns.snapshot(view.cooldown),
+        "breaker": {"group": circuit_breaker.group_label(d.model_group), **circuit_breaker.snapshot(view.breaker)},
+        "health": health.snapshot(view.health),
     }
 
 
-def gateway_status(deployments) -> dict:
-    entries = [deployment_status(d) for d in deployments]
+async def gateway_status(deployments) -> dict:
+    views = await selection.build_view(deployments, STATUS_NEED)
+    entries = [deployment_status(v) for v in views]
     waits = [e["ready_in_s"] for e in entries if e["ready_in_s"] is not None]
     verdicts = Counter(e["verdict"] for e in entries)
     return {
+        "state_store": get_store().backend,
+        "admission": get_admission().snapshot(),
         "deployments_total": len(entries),
         "deployments_ready": verdicts.get("ready", 0),
         "by_verdict": dict(verdicts),

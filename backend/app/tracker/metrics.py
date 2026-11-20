@@ -67,6 +67,7 @@ ATTEMPT_SCHEMA = (
     "CREATE INDEX IF NOT EXISTS attempt_logs_timestamp_idx ON attempt_logs (timestamp)",
     "CREATE INDEX IF NOT EXISTS attempt_logs_deployment_time_idx ON attempt_logs (deployment_id, timestamp)",
     "CREATE INDEX IF NOT EXISTS attempt_logs_request_id_idx ON attempt_logs (request_id)",
+    "ALTER TABLE attempt_logs ADD COLUMN IF NOT EXISTS error_detail TEXT",
 )
 
 
@@ -186,7 +187,7 @@ async def _deployment_metrics(pool, W: str, args: tuple) -> dict | None:
             "share_of_pool_pct": _pct(calls, pool_calls[group]),
             "errors": errors,
             "error_rate_pct": _pct(calls - (row["successes"] if row else 0), calls),
-            "provider_429s": errors.get("rate_limited", 0),
+            "provider_429s": errors.get("rate_limited", 0) + errors.get("quota_exhausted", 0),
             "latency_ms": {"p50": _r(row["p50"]) if row else None, "p95": _r(row["p95"]) if row else None},
             "tokens": {
                 "total_input": int(tok["input"]) if tok and tok["input"] is not None else None,
