@@ -1,13 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { AlertTriangle, ArrowDown, ArrowRight, ArrowUp, Minus } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowRight, ArrowUp, Minus, SearchX } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { LiveBadge } from '@/components/LiveBadge'
 import { UnreachableNotice, WakingNotice } from '@/components/GatewayNotice'
 import { useColdStart } from '@/hooks/useColdStart'
 import { OVERVIEW } from '@/config/overview'
-import { formatCount, formatLatency, formatPercent, formatWait, formatWindow } from '@/lib/format'
+import { formatCount, formatLatency, formatModel, formatPercent, formatProvider, formatWait, formatWindow } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
   fetchMetricsSnapshots,
@@ -145,6 +145,37 @@ function ProofRow({ before, after }: { before: MetricsSnapshot; after: MetricsSn
   )
 }
 
+function MissingProofPlaceholder({ labels }: { labels: string[] }) {
+  return (
+    <section className="animate-card-in rounded-xl border-2 border-dashed border-amber-300 bg-amber-50/60 p-5">
+      <div className="flex items-start gap-3">
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-100 text-amber-700">
+          <SearchX className="h-4 w-4" />
+        </span>
+        <div className="min-w-0 space-y-2">
+          <p className="text-sm font-semibold text-amber-900">
+            Proof row hidden: {labels.length === 1 ? 'snapshot' : 'snapshots'} not found
+            <span className="ml-2 rounded border border-amber-200 bg-white px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-amber-600">
+              dev only
+            </span>
+          </p>
+          <ul className="flex flex-wrap gap-2">
+            {labels.map((l) => (
+              <li key={l} className="rounded-md border border-amber-200 bg-white px-2 py-1 font-mono text-xs text-amber-800">
+                {l}
+              </li>
+            ))}
+          </ul>
+          <p className="text-xs text-amber-800/80">
+            Save it with <code className="font-mono">POST /metrics/snapshots</code> using this exact label, or fix the label in{' '}
+            <code className="font-mono">config/overview.ts</code>. In production this row is hidden and a console warning is logged.
+          </p>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function ProofSkeleton() {
   return (
     <div className="grid gap-3 sm:grid-cols-3">
@@ -163,7 +194,7 @@ function DeploymentTile({ d }: { d: DeploymentStatus }) {
   return (
     <div className="rounded-xl border border-stone-200 bg-white p-3.5 shadow-sm transition-shadow duration-200 hover:shadow-md">
       <div className="flex items-start justify-between gap-2">
-        <p className="truncate text-sm font-medium text-stone-900" title={`${d.provider} · ${d.model}`}>
+        <p className="truncate text-sm font-medium text-stone-900" title={`${formatProvider(d.provider)} · ${formatModel(d.model)}`}>
           {d.id}
         </p>
         <span className="shrink-0 rounded-md border border-stone-200 bg-stone-50 px-1.5 text-xs leading-5 text-stone-500">
@@ -189,6 +220,7 @@ function DeploymentTile({ d }: { d: DeploymentStatus }) {
 }
 
 function LivePool({ status }: { status: GatewayStatus }) {
+  const someNotReady = status.deployments_ready < status.deployments_total
   const next = status.deployments_ready > 0 ? 'now' : formatWait(status.soonest_ready_in_s)
   return (
     <section className="space-y-3">
@@ -199,7 +231,7 @@ function LivePool({ status }: { status: GatewayStatus }) {
             <span className="font-medium text-stone-900">
               {status.deployments_ready} / {status.deployments_total}
             </span>{' '}
-            ready · next capacity: {next}
+            ready{someNotReady && <> · next capacity: {next}</>}
           </p>
         </div>
         <Link
@@ -286,8 +318,27 @@ export function OverviewPage() {
     if (!snapshots) return null
     const before = findSnapshot(snapshots, OVERVIEW.beforeSnapshotLabel)
     const after = findSnapshot(snapshots, OVERVIEW.afterSnapshotLabel)
-    return before && after ? { before, after } : null
+    const missing = [
+      ...(before ? [] : [OVERVIEW.beforeSnapshotLabel]),
+      ...(after ? [] : [OVERVIEW.afterSnapshotLabel]),
+    ]
+    return { before, after, missing }
   }, [snapshots])
+
+  const warned = useRef(false)
+  useEffect(() => {
+    if (import.meta.env.DEV || warned.current || !proof?.missing.length) return
+    warned.current = true
+    console.warn(`[overview] proof row hidden: snapshot label(s) not found: ${proof.missing.map((l) => `"${l}"`).join(', ')}`)
+  }, [proof])
+
+  const proofRow = !proof
+    ? null
+    : proof.before && proof.after
+      ? <ProofRow before={proof.before} after={proof.after} />
+      : import.meta.env.DEV
+        ? <MissingProofPlaceholder labels={proof.missing} />
+        : null
 
   const badge = status && !statusFailed
     ? <LiveBadge tone="live" label="Live" />
@@ -313,7 +364,7 @@ export function OverviewPage() {
       ) : (
         <>
           {waking && <WakingNotice />}
-          {snapshots === undefined ? <ProofSkeleton /> : proof && <ProofRow before={proof.before} after={proof.after} />}
+          {snapshots === undefined ? <ProofSkeleton /> : proofRow}
           {status ? <LivePool status={status} /> : <PoolSkeleton />}
         </>
       )}

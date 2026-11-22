@@ -41,12 +41,13 @@ import {
   type RequestRecord,
 } from '@/lib/api'
 import { OVERVIEW } from '@/config/overview'
+import { formatBreakerScope, formatLatency, formatProvider } from '@/lib/format'
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
 function fms(v: number | null | undefined): string {
   if (v == null) return 'not recorded'
-  return v.toFixed(1) + ' ms'
+  return formatLatency(v)
 }
 function fpct(v: number | null | undefined): string {
   if (v == null) return 'not recorded'
@@ -273,7 +274,7 @@ function LatencyBarChart({ data }: { data: MetricsSummary['latency_ms'] }) {
       <BarChart data={chartData} barGap={4} barSize={28} margin={{ left: 0, right: 8 }}>
         <CartesianGrid vertical={false} stroke="#F5F5F4" />
         <XAxis dataKey="group" tick={{ fill: '#A8A29E', fontSize: 11 }} axisLine={false} tickLine={false} />
-        <YAxis tick={{ fill: '#A8A29E', fontSize: 11 }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => v + 'ms'} />
+        <YAxis tick={{ fill: '#A8A29E', fontSize: 11 }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => formatLatency(v)} />
         <Tooltip
           content={({ active, payload, label }: TooltipContentProps<TooltipValueType, string | number>) => {
             if (!active || !payload?.length) return null
@@ -283,7 +284,7 @@ function LatencyBarChart({ data }: { data: MetricsSummary['latency_ms'] }) {
                 {payload.map(p => (
                   <p key={String(p.name)} style={{ color: p.color }}>
                     <span className="text-stone-500">{p.name}: </span>
-                    <span className="font-medium text-stone-800">{typeof p.value === 'number' ? p.value.toFixed(1) + ' ms' : 'not recorded'}</span>
+                    <span className="font-medium text-stone-800">{typeof p.value === 'number' ? formatLatency(p.value) : 'not recorded'}</span>
                   </p>
                 ))}
               </div>
@@ -325,7 +326,7 @@ function LatencyTimelineChart({ requests, experiments }: { requests: RequestReco
         />
         <YAxis
           dataKey="latency_ms" tick={{ fill: '#A8A29E', fontSize: 11 }} axisLine={false} tickLine={false}
-          width={52} tickFormatter={(v: number) => v + 'ms'}
+          width={52} tickFormatter={(v: number) => formatLatency(v)}
         />
         <Tooltip
           content={({ active, payload }: TooltipContentProps<TooltipValueType, string | number>) => {
@@ -334,7 +335,7 @@ function LatencyTimelineChart({ requests, experiments }: { requests: RequestReco
             return (
               <div className="rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs shadow-lg space-y-0.5">
                 <p className="text-stone-400">{new Date(d.ts).toLocaleString()}</p>
-                <p className="font-medium text-stone-800">{d.latency_ms.toFixed(1)} ms</p>
+                <p className="font-medium text-stone-800">{formatLatency(d.latency_ms)}</p>
                 <p className={d.cache_hit ? 'text-green-600' : 'text-violet-600'}>{d.cache_hit ? 'Cache hit' : 'Cache miss'}</p>
               </div>
             )
@@ -367,7 +368,6 @@ interface SnapRow {
   avgLatencyMiss: number | null
   p95LatencyMiss: number | null
   totalCostUsd: number | null
-  estSavedUsd: number | null
 }
 
 function toSnapRow(label: string, m: MetricsSummary): SnapRow {
@@ -384,14 +384,13 @@ function toSnapRow(label: string, m: MetricsSummary): SnapRow {
     avgLatencyMiss: m.latency_ms.miss.avg,
     p95LatencyMiss: m.latency_ms.miss.p95,
     totalCostUsd: m.cost.total_usd,
-    estSavedUsd: m.cost.est_saved_usd,
   }
 }
 
 // true = lower is better, false = higher is better, null = neutral
 function lib(key: keyof SnapRow): boolean | null {
   if (key === 'requests' || key === 'label') return null
-  if (key === 'hitRatePct' || key === 'estSavedUsd') return false
+  if (key === 'hitRatePct') return false
   return true
 }
 
@@ -407,7 +406,6 @@ const CMP_ROWS: { key: keyof SnapRow; label: string; fmt: (v: number | null) => 
   { key: 'avgLatencyMiss',  label: 'Avg latency (miss)',   fmt: fms  },
   { key: 'p95LatencyMiss',  label: 'p95 latency (miss)',   fmt: fms  },
   { key: 'totalCostUsd',    label: 'Total cost',           fmt: fusd },
-  { key: 'estSavedUsd',     label: 'Est. saved',           fmt: fusd },
 ]
 
 function DeltaCell({ prev, curr, metricKey, fmt }: {
@@ -640,7 +638,7 @@ export function BaselinePage() {
 
           {/* 2. Latency */}
           <Card>
-            <CardHeader><CardTitle>Latency (ms)</CardTitle></CardHeader>
+            <CardHeader><CardTitle>Latency</CardTitle></CardHeader>
             <CardContent className="space-y-6">
               <LatencyTable data={summary.latency_ms} />
               <div>
@@ -715,11 +713,11 @@ export function BaselinePage() {
                 ) : (
                   <div className="overflow-x-auto">
                     <table className="w-full border-collapse">
-                      <thead><tr className="border-b border-stone-100"><Th>Provider</Th><Th right>Reqs</Th><Th right>Avg ms</Th><Th right>p95 ms</Th><Th right>Avg cost</Th><Th right>Fallbacks</Th></tr></thead>
+                      <thead><tr className="border-b border-stone-100"><Th>Provider</Th><Th right>Reqs</Th><Th right>Avg latency</Th><Th right>p95 latency</Th><Th right>Avg cost</Th><Th right>Fallbacks</Th></tr></thead>
                       <tbody>
                         {summary.by_provider.map(p => (
                           <tr key={p.provider} className="border-b border-stone-50 hover:bg-stone-50 transition-colors">
-                            <Td><span className="capitalize font-medium text-stone-700">{p.provider}</span></Td>
+                            <Td><span className="font-medium text-stone-700">{formatProvider(p.provider)}</span></Td>
                             <Td right mono>{p.requests.toLocaleString()}</Td>
                             <Td right mono>{p.avg_latency_ms == null ? <NR /> : fms(p.avg_latency_ms)}</Td>
                             <Td right mono>{p.p95_latency_ms == null ? <NR /> : fms(p.p95_latency_ms)}</Td>
@@ -772,7 +770,7 @@ export function BaselinePage() {
                       <tbody>
                         {summary.breaker.transitions.map((t, i) => (
                           <tr key={i} className="border-b border-stone-50 hover:bg-stone-50 transition-colors">
-                            <Td><span className="capitalize font-medium text-stone-700">{t.provider}</span></Td>
+                            <Td><span className="font-medium text-stone-700">{formatBreakerScope(t.provider)}</span></Td>
                             <Td>
                               <Badge className={
                                 t.new_state === 'closed' ? 'border-green-200 bg-green-50 text-green-800'
@@ -795,33 +793,20 @@ export function BaselinePage() {
           <Card>
             <CardHeader><CardTitle>Cost breakdown</CardTitle></CardHeader>
             <CardContent>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 {([
-                  { label: 'Total cost',   value: fusd(summary.cost.total_usd),   estimate: false },
-                  { label: 'Avg miss cost', value: fusd(summary.cost.avg_miss_usd), estimate: false },
-                  { label: 'Avg hit cost',  value: fusd(summary.cost.avg_hit_usd),  estimate: false },
-                  { label: 'Est. saved',   value: fusd(summary.cost.est_saved_usd), estimate: true  },
-                ] as const).map(({ label, value, estimate }) => (
+                  { label: 'Total cost',    value: fusd(summary.cost.total_usd) },
+                  { label: 'Avg miss cost', value: fusd(summary.cost.avg_miss_usd) },
+                  { label: 'Avg hit cost',  value: fusd(summary.cost.avg_hit_usd) },
+                ] as const).map(({ label, value }) => (
                   <div key={label} className="flex flex-col rounded-lg border border-stone-100 bg-stone-50 px-4 py-3">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <span className="text-[10px] font-semibold uppercase tracking-widest text-stone-400">{label}</span>
-                      {estimate && (
-                        <span title="Computed as hits x average miss cost. Not a directly measured value."
-                          className="inline-flex items-center gap-0.5 rounded border border-stone-200 bg-white px-1 py-0 text-[9px] font-semibold text-stone-400 leading-4 cursor-help">
-                          <Info className="w-2 h-2" />ESTIMATE
-                        </span>
-                      )}
-                    </div>
+                    <span className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-stone-400">{label}</span>
                     <span className="text-lg font-semibold text-stone-800 tabular-nums leading-tight">
                       {value === 'not recorded' ? <NR /> : value}
                     </span>
                   </div>
                 ))}
               </div>
-              <p className="text-xs text-stone-400 mt-4 flex items-center gap-1">
-                <Info className="w-3 h-3 shrink-0" />
-                "Est. saved" = cache hits x (avg miss cost - avg hit cost). It is an estimate, not a direct measurement.
-              </p>
             </CardContent>
           </Card>
 

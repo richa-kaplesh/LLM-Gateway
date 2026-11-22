@@ -6,13 +6,13 @@ A gateway that sits between client apps and several free-tier LLM providers. It 
 
 ## Results
 
-Measured on the live deployment with a real client (QueryMind, an LLM data agent), 50-question evaluation, compared with the original design:
+Measured on the live deployment. **After:** a real client (QueryMind, an LLM data agent) running a 50-question evaluation (2026-11-20). **Before:** all gateway traffic on the original provider-routing design, 2026-10-01 → 2026-11-18 (1,444 requests). Both windows are saved as `/metrics/snapshots`.
 
 | | Before | After |
 |---|---|---|
-| Gateway error rate | 21.5% | **6.7%** |
-| Latency p50 / p95 | 0.63 s / 26.5 s | 0.52 s / **0.99 s** |
-| Fallback rate | 19.8% | 7.8% |
+| Gateway error rate | 21.0% | **6.7%** |
+| Latency p50 / p95 | 0.61 s / 25.7 s | 0.52 s / **0.99 s** |
+| Fallback rate | 20.0% | 7.8% |
 | Questions with no answer | 3 of 45 | 0 of 50 |
 | Spread across Groq keys | not measured | 61 / 58 / 58 attempts (1% imbalance) |
 
@@ -219,7 +219,7 @@ frontend/        React + TypeScript + Vite + Tailwind dashboard
 
 ## Engineering log: bugs worth remembering
 
-- **Retrying in place made failure slow.** Three 2 s sleeps on the same key plus a 20 s queue gave a p95 of 26.5 s. Failing over at once brought it to 0.99 s.
+- **Retrying in place made failure slow.** Three 2 s sleeps on the same key plus a 20 s queue gave a p95 of 25.7 s. Failing over at once brought it to 0.99 s.
 - **An overloaded provider was treated as dead.** Gemini's 503 "high demand" counted as a breaker failure, and a fixed 30 s cooldown made it flap 98 times. The real cause was a 20-requests-a-day free tier. Fixed with separate `overloaded` / `down` classes and exponential backoff.
 - **`"None | None"` in 429 errors.** `str(None)` is truthy. It also revealed that no provider had refused those requests: the gateway's own estimates had.
 - **Invalid tool calls opened the breaker.** Groq's 400 `tool_use_failed` was mapped to "unavailable", so three in a row blocked all three healthy keys. In the eval, 10 of 14 such requests succeeded on the next attempt.

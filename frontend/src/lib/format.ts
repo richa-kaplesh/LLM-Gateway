@@ -1,6 +1,28 @@
 export function formatLatency(ms: number): string {
-  if (ms < 1000) return `${Math.round(ms)} ms`
-  return `${(ms / 1000).toFixed(1)} s`
+  const sign = ms < 0 ? '-' : ''
+  const abs = Math.abs(ms)
+  if (abs < 999.5) return `${sign}${Math.round(abs)} ms`
+  return `${sign}${(abs / 1000).toFixed(1)} s`
+}
+
+const PROVIDER_NAMES: Record<string, string> = {
+  groq: 'Groq',
+  gemini: 'Gemini',
+  openrouter: 'OpenRouter',
+}
+
+export function formatProvider(provider: string): string {
+  return PROVIDER_NAMES[provider.trim().toLowerCase()] ?? provider
+}
+
+export function formatModel(model: string): string {
+  return model.split('/').pop() || model
+}
+
+export function formatBreakerScope(scope: string): string {
+  const i = scope.indexOf(':')
+  if (i < 0) return formatProvider(scope)
+  return `${formatProvider(scope.slice(0, i))} · ${formatModel(scope.slice(i + 1))}`
 }
 
 export function formatPercent(pct: number): string {
