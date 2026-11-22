@@ -2,7 +2,7 @@ const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
 const API_KEY_STORAGE = 'gatewayApiKey'
 
-function readApiKey(): string | null {
+export function readApiKey(): string | null {
   try {
     return window.localStorage.getItem(API_KEY_STORAGE)
   } catch {
@@ -10,7 +10,7 @@ function readApiKey(): string | null {
   }
 }
 
-function storeApiKey(key: string | null) {
+export function storeApiKey(key: string | null) {
   try {
     if (key) window.localStorage.setItem(API_KEY_STORAGE, key)
     else window.localStorage.removeItem(API_KEY_STORAGE)
@@ -19,20 +19,27 @@ function storeApiKey(key: string | null) {
   }
 }
 
+export class ApiKeyError extends Error {
+  readonly hadKey: boolean
+  constructor(hadKey: boolean) {
+    super(hadKey ? 'The saved API key was rejected.' : 'This action needs an API key. Add one on the Try it page.')
+    this.name = 'ApiKeyError'
+    this.hadKey = hadKey
+  }
+}
+
 async function postWithKey(path: string, body: unknown): Promise<Response> {
-  const send = (key: string | null) =>
-    fetch(`${API_BASE}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(key ? { 'X-API-Key': key } : {}) },
-      body: JSON.stringify(body),
-    })
-  const res = await send(readApiKey())
-  if (res.status !== 401) return res
-  const entered = window.prompt('This gateway needs an API key for write requests. Enter X-API-Key:')
-  if (!entered) return res
-  const retry = await send(entered.trim())
-  storeApiKey(retry.status === 401 ? null : entered.trim())
-  return retry
+  const key = readApiKey()
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(key ? { 'X-API-Key': key } : {}) },
+    body: JSON.stringify(body),
+  })
+  if (res.status === 401) {
+    if (key) storeApiKey(null)
+    throw new ApiKeyError(Boolean(key))
+  }
+  return res
 }
 
 // ── Query ─────────────────────────────────────────────────────────────────────

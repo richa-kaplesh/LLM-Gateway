@@ -2,7 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Toaster } from 'sonner'
 import { Layout } from '@/components/Layout'
 import { QueryPage } from '@/pages/QueryPage'
-import { DashboardPage } from '@/pages/DashboardPage'
+import { OverviewPage } from '@/pages/OverviewPage'
 import { ExperimentsPage } from '@/pages/ExperimentsPage'
 import { BaselinePage } from '@/pages/BaselinePage'
 import { KeysPage } from '@/pages/KeysPage'
@@ -25,8 +25,9 @@ export default function App() {
       />
       <Routes>
         <Route element={<Layout />}>
-          <Route path="/" element={<QueryPage />} />
-          <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/" element={<OverviewPage />} />
+          <Route path="/try" element={<QueryPage />} />
+          <Route path="/dashboard" element={<Navigate to="/" replace />} />
           <Route path="/keys" element={<KeysPage />} />
           <Route path="/experiments" element={<ExperimentsPage />} />
           <Route path="/baseline" element={<BaselinePage />} />

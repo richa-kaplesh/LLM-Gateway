@@ -75,6 +75,54 @@
     "description": "Every failure mode (InvalidRequestError, TooLongError, all-providers-rate-limited, genuine server errors) returned a blanket 500, giving callers no way to distinguish 'retry this' from 'never retry this' from 'wait and retry.' Added AllProvidersRateLimitedError and mapped each exception type to its correct HTTP status: 400 for malformed requests, 413 for prompts too long for any provider, 429 for temporary capacity exhaustion, 500 reserved for genuinely unexpected failures. Also scoped log levels so expected rejections (400/413) log at info, not error, keeping the error log reserved for real bugs.",
     "metrics": { "distinct_error_status_codes_before": 1, "distinct_error_status_codes_after": 4 },
     "timestamp": "2026-10-02T06:00:00+00:00"
+  },
+  {
+    "name": "gateway_phase1_2_before",
+    "category": "reliability",
+    "description": "Baseline before the per-deployment redesign: live /metrics/summary on Render, 2026-10-01 to 2026-11-17, 1,390 requests. Gemini's breaker flapped (98 opens, 6 closes), 190 requests failed with AllProvidersRateLimitedError, and p95 latency came from queue waits plus 2 s in-place retry sleeps instead of failing over.",
+    "metrics": { "error_rate_pct": 21.5, "p95_latency_ms": 26500, "p99_latency_ms": 34400, "fallback_rate_pct": 19.8 },
+    "timestamp": "2026-11-17T12:00:00+00:00"
+  },
+  {
+    "name": "gateway_phase1_2_after",
+    "category": "reliability",
+    "description": "After Phases 1 and 2: deployments = key x model from deployments.yaml, Gemini dropped, Groq x3 + OpenRouter x2 pooled, in-place retries removed (fail over at once), per-deployment daily counter, and every attempt logged to attempt_logs. Measured with QueryMind's 50-question eval, 165 gateway requests. Caveat: 1 user, sequential, versus all traffic in the baseline; the 10-user target is still untested.",
+    "metrics": { "error_rate_pct": 6.7, "p95_latency_ms": 990, "p99_latency_ms": 1290, "fallback_rate_pct": 7.8 },
+    "timestamp": "2026-11-20T12:00:00+00:00"
+  },
+  {
+    "name": "invalid_tool_call_classification",
+    "category": "adapter",
+    "description": "Groq's HTTP 400 tool_use_failed was mapped to ProviderUnavailableError, so a bad output from the model counted as the model being down: 3 in a row opened the groq:gpt-oss-20b breaker and blocked all 3 healthy keys. Most of these requests succeeded on the next sample, so InvalidToolCallError became its own class: the breaker marks the provider reachable, no key cooldown, the router tries another key, and only 3 in a row returns 502 invalid_tool_call.",
+    "metrics": { "invalid_tool_call_attempts": 18, "requests_with_invalid_tool_call": 14, "recovered_on_next_sample": 10, "breaker_opens_caused": 1 },
+    "timestamp": "2026-11-20T13:00:00+00:00"
+  },
+  {
+    "name": "gateway_capacity_1_instance",
+    "category": "scaling",
+    "description": "Mock capacity test: one gateway process, memory store, DB off, against a mock provider with unlimited quota and 400 +/- 150 ms latency, so only the gateway can be the bottleneck. Linear up to 50 users at about 2,500 calls/min with p95 under 1 s; the knee is between 50 and 100 users, where queueing and load shedding start. That is 30-60x QueryMind's target load, so real limits are provider quota, not the gateway.",
+    "metrics": { "calls_per_min_at_50_users": 2478, "p95_ms_at_50_users": 789, "calls_per_min_at_100_users": 3587, "p95_ms_at_100_users": 1964 },
+    "timestamp": "2026-11-20T20:00:00+00:00"
+  },
+  {
+    "name": "redis_state_store_before",
+    "category": "scaling",
+    "description": "Same mock capacity test at 50 users with all mutable state (meters, cooldowns, breakers, health, sticky pins) in the in-process MemoryStore. Fast, but a second instance would double-spend quota and a restart loses everything.",
+    "metrics": { "calls_per_min": 2478, "p95_latency_ms": 789 },
+    "timestamp": "2026-11-21T10:00:00+00:00"
+  },
+  {
+    "name": "redis_state_store_after",
+    "category": "scaling",
+    "description": "Same test with RedisStore (local Redis): meters updated atomically by Lua scripts, breaker/cooldown/health by optimistic CAS. State survives restarts and is shared across instances, at a cost of about 22% throughput and 1 s of p95 per instance. The cause is about 37 mostly sequential Redis commands per gateway call (P22), not Redis itself.",
+    "metrics": { "calls_per_min": 1936, "p95_latency_ms": 1804 },
+    "timestamp": "2026-11-21T10:30:00+00:00"
+  },
+  {
+    "name": "scale_out_2_instances",
+    "category": "scaling",
+    "description": "Two gateway processes sharing one Redis, 25 users each. Same latency as one memory instance at 50 users, and the mock provider saw zero 429s across all 6,015 calls, so the shared meters stop the instances from double-spending quota.",
+    "metrics": { "calls_per_min": 2385, "p95_latency_ms": 800, "provider_429s": 0, "total_calls": 6015, "redis_commands_per_call": 37 },
+    "timestamp": "2026-11-21T11:00:00+00:00"
   }
-
 ]

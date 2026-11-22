@@ -1,14 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Send, Clock, DollarSign, Zap, CheckCircle2, Circle, Loader2, Wrench } from 'lucide-react'
+import { Send, Clock, DollarSign, Zap, CheckCircle2, Circle, Loader2, Wrench, KeyRound } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
-import { postQuery, type QueryResponse, type GatewayMessage } from '@/lib/api'
+import { postQuery, readApiKey, storeApiKey, ApiKeyError, type QueryResponse, type GatewayMessage } from '@/lib/api'
 
 interface HistoryEntry {
   id: string
@@ -88,6 +88,59 @@ function ResponseCard({ entry }: { entry: HistoryEntry }) {
   )
 }
 
+function ApiKeyPanel({ apiKey, rejected, onSave, onClear }: {
+  apiKey: string | null
+  rejected: boolean
+  onSave: (key: string) => void
+  onClear: () => void
+}) {
+  const [draft, setDraft] = useState('')
+
+  if (apiKey) {
+    return (
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-stone-200 bg-white px-4 py-2.5 text-sm text-stone-600 shadow-sm">
+        <span className="flex items-center gap-2">
+          <KeyRound className="w-4 h-4 text-emerald-600" />
+          API key saved in this browser
+          <span className="font-mono text-xs text-stone-400">••••{apiKey.slice(-4)}</span>
+        </span>
+        <Button variant="ghost" size="sm" onClick={onClear}>Remove</Button>
+      </div>
+    )
+  }
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault()
+    const key = draft.trim()
+    if (!key) return
+    onSave(key)
+    setDraft('')
+  }
+
+  return (
+    <form onSubmit={submit} className="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-3 animate-card-in">
+      <div className="flex items-start gap-2.5 text-sm text-amber-900">
+        <KeyRound className="w-4 h-4 mt-0.5 shrink-0 text-amber-700" />
+        <div className="space-y-1">
+          <p>Sending queries needs an API key. Everything else on this dashboard is public.</p>
+          {rejected && <p className="text-xs text-red-700">That key was rejected. Check it and try again.</p>}
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <Input
+          type="password"
+          autoComplete="off"
+          placeholder="X-API-Key"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          className="h-9 flex-1"
+        />
+        <Button type="submit" disabled={!draft.trim()}>Save key</Button>
+      </div>
+    </form>
+  )
+}
+
 export function QueryPage() {
   // One conversation_id per page mount — reused across all messages in this session
   const [conversationId] = useState(() => crypto.randomUUID())
@@ -97,6 +150,8 @@ export function QueryPage() {
   const [history, setHistory] = useState<HistoryEntry[]>([])
   // Full message thread for the backend
   const [messages, setMessages] = useState<GatewayMessage[]>([])
+  const [apiKey, setApiKey] = useState<string | null>(() => readApiKey())
+  const [keyRejected, setKeyRejected] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -105,7 +160,7 @@ export function QueryPage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    if (!query.trim()) return
+    if (!query.trim() || !apiKey) return
     if (!userId.trim()) {
       toast.error('Please enter a User ID.')
       return
@@ -140,6 +195,11 @@ export function QueryPage() {
       setQuery('')
       toast.success('Response received.')
     } catch (err) {
+      if (err instanceof ApiKeyError) {
+        setApiKey(readApiKey())
+        setKeyRejected(err.hadKey)
+        return
+      }
       toast.error((err as Error).message || 'Failed to reach the gateway.')
     } finally {
       setLoading(false)
@@ -158,8 +218,8 @@ export function QueryPage() {
       <div className="py-5 border-b border-stone-200">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h1 className="text-xl font-semibold text-stone-900">Query Interface</h1>
-            <p className="text-sm text-stone-500 mt-0.5">Send queries to the LLM Gateway</p>
+            <h1 className="text-xl font-semibold text-stone-900">Try it</h1>
+            <p className="text-sm text-stone-500 mt-0.5">Send a query through the gateway and see which key answered</p>
           </div>
           {/* User ID — session-level setting */}
           <div className="flex flex-col gap-1 shrink-0">
@@ -172,6 +232,22 @@ export function QueryPage() {
             />
           </div>
         </div>
+      </div>
+
+      <div className="pt-4">
+        <ApiKeyPanel
+          apiKey={apiKey}
+          rejected={keyRejected}
+          onSave={(key) => {
+            storeApiKey(key)
+            setApiKey(key)
+            setKeyRejected(false)
+          }}
+          onClear={() => {
+            storeApiKey(null)
+            setApiKey(null)
+          }}
+        />
       </div>
 
       {/* Conversation history */}
@@ -274,7 +350,7 @@ export function QueryPage() {
             />
             <Button
               type="submit"
-              disabled={loading || !query.trim() || !userId.trim()}
+              disabled={loading || !apiKey || !query.trim() || !userId.trim()}
               className={`h-[76px] px-5 transition-all duration-150 ${loading ? 'opacity-80' : ''}`}
             >
               {loading ? (

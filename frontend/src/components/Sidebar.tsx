@@ -1,13 +1,13 @@
 import { NavLink } from 'react-router-dom'
-import { MessageSquare, BarChart2, Zap, FlaskConical, Gauge, KeyRound } from 'lucide-react'
+import { MessageSquare, LayoutDashboard, Zap, FlaskConical, Gauge, KeyRound } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const navItems = [
-  { to: '/', label: 'Query', icon: MessageSquare },
-  { to: '/dashboard', label: 'Dashboard', icon: BarChart2 },
+  { to: '/', label: 'Overview', icon: LayoutDashboard },
   { to: '/keys', label: 'Keys', icon: KeyRound },
   { to: '/experiments', label: 'Experiments', icon: FlaskConical },
   { to: '/baseline', label: 'Baseline', icon: Gauge },
+  { to: '/try', label: 'Try it', icon: MessageSquare },
 ]
 
 export function Sidebar() {

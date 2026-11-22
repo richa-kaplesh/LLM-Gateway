@@ -79,6 +79,7 @@ const CATEGORY_COLORS: Record<string, string> = {
   adapter:     'border-violet-200 bg-violet-50 text-violet-800',
   cache:       'border-green-200  bg-green-50  text-green-800',
   cost:        'border-orange-200 bg-orange-50 text-orange-800',
+  scaling:     'border-sky-200    bg-sky-50    text-sky-800',
 }
 
 function categoryBadgeClass(category: string): string {
@@ -413,8 +414,10 @@ export function ExperimentsPage() {
   }, [])
 
   useEffect(() => {
-    load()
-  }, [load])
+    fetchExperiments()
+      .then(setExperiments, (err: Error) => toast.error(err.message || 'Failed to load experiments.'))
+      .finally(() => setLoading(false))
+  }, [])
 
   // Group experiments by category, preserving insertion order
   const byCategory = useMemo(() => {

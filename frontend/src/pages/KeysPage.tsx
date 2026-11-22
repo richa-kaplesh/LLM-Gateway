@@ -21,6 +21,9 @@ import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { LiveBadge } from '@/components/LiveBadge'
+import { UnreachableNotice, WakingNotice } from '@/components/GatewayNotice'
+import { useColdStart } from '@/hooks/useColdStart'
 import { cn } from '@/lib/utils'
 import {
   fetchMetricsSummary,
@@ -508,7 +511,8 @@ function sortValue(d: DeploymentHistory, k: SortKey): number | string {
 export function KeysPage() {
   const [live, setLive] = useState<GatewayStatus | null>(null)
   const [liveAt, setLiveAt] = useState(0)
-  const [liveError, setLiveError] = useState<string | null>(null)
+  const [liveError, setLiveError] = useState(false)
+  const [attempt, setAttempt] = useState(0)
   const [paused, setPaused] = useState(false)
   const [now, setNow] = useState(() => Date.now())
 
@@ -521,39 +525,54 @@ export function KeysPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [sort, setSort] = useState<{ key: SortKey; dir: 'asc' | 'desc' }>({ key: 'provider_calls', dir: 'desc' })
 
-  const loadLive = useCallback(async () => {
-    try {
-      const s = await fetchStatus()
-      setLive(s)
-      setLiveAt(Date.now())
-      setLiveError(null)
-    } catch (err) {
-      setLiveError((err as Error).message || 'Gateway unreachable')
-    }
+  const applyLive = useCallback((s: GatewayStatus) => {
+    setLive(s)
+    setLiveAt(Date.now())
+    setLiveError(false)
   }, [])
 
-  const loadHistory = useCallback(async (key: WindowKey) => {
-    setHistoryLoading(true)
-    try {
-      const w = WINDOWS.find((x) => x.key === key)!
-      const since = w.ms == null ? undefined : new Date(Date.now() - w.ms).toISOString()
-      const summary = await fetchMetricsSummary(since)
-      setHistory(summary.deployments ?? null)
-    } catch (err) {
-      toast.error((err as Error).message || 'Failed to load history.')
-      setHistory(null)
-    } finally {
-      setHistoryLoading(false)
-    }
+  const loadLive = useCallback(
+    () => fetchStatus().then(applyLive, () => setLiveError(true)),
+    [applyLive],
+  )
+
+  const fetchHistory = useCallback((key: WindowKey) => {
+    const w = WINDOWS.find((x) => x.key === key)!
+    const since = w.ms == null ? undefined : new Date(Date.now() - w.ms).toISOString()
+    return fetchMetricsSummary(since)
+      .then(
+        (summary) => setHistory(summary.deployments ?? null),
+        () => {
+          toast.error("Couldn't load history.")
+          setHistory(null)
+        },
+      )
+      .finally(() => setHistoryLoading(false))
   }, [])
 
-  useEffect(() => {
-    loadLive()
-  }, [loadLive])
+  const loadHistory = useCallback(
+    (key: WindowKey) => {
+      setHistoryLoading(true)
+      return fetchHistory(key)
+    },
+    [fetchHistory],
+  )
 
   useEffect(() => {
+    fetchStatus().then(applyLive, () => setLiveError(true))
+  }, [attempt, applyLive])
+
+  const { waking, timedOut } = useColdStart(!live && !liveError, attempt)
+  const unreachable = !live && (liveError || timedOut)
+  const retry = () => {
+    setLiveError(false)
+    setAttempt((a) => a + 1)
     loadHistory(windowKey)
-  }, [loadHistory, windowKey])
+  }
+
+  useEffect(() => {
+    fetchHistory(windowKey)
+  }, [fetchHistory, windowKey])
 
   useEffect(() => {
     if (paused) return
@@ -630,30 +649,12 @@ export function KeysPage() {
           <p className="mt-0.5 text-sm text-stone-500">Live capacity per deployment and how traffic was spread</p>
         </div>
         <div className="flex items-center gap-2">
-          <span
-            className={cn(
-              'inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs',
-              liveError
-                ? 'border-red-200 bg-red-50 text-red-700'
-                : paused
-                  ? 'border-stone-200 bg-white text-stone-500'
-                  : 'border-emerald-200 bg-emerald-50 text-emerald-700',
-            )}
+          <LiveBadge
+            tone={liveError ? 'error' : paused ? 'idle' : 'live'}
+            label={liveError ? 'Gateway unreachable' : paused ? 'Paused' : 'Live'}
           >
-            <span className="relative flex h-2 w-2">
-              {!paused && !liveError && (
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-70" />
-              )}
-              <span
-                className={cn(
-                  'relative inline-flex h-2 w-2 rounded-full',
-                  liveError ? 'bg-red-500' : paused ? 'bg-stone-400' : 'bg-emerald-500',
-                )}
-              />
-            </span>
-            {liveError ? 'Gateway unreachable' : paused ? 'Paused' : 'Live'}
             {liveAt > 0 && <span className="tabular-nums opacity-70">· {Math.floor(elapsed)}s ago</span>}
-          </span>
+          </LiveBadge>
           <Button variant="outline" size="sm" onClick={() => setPaused((p) => !p)} className="gap-1.5">
             {paused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
             {paused ? 'Resume' : 'Pause'}
@@ -667,9 +668,12 @@ export function KeysPage() {
       {liveError && live && (
         <div className="flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
           <TriangleAlert className="h-3.5 w-3.5 shrink-0" />
-          Showing the last good reading. {liveError}
+          Showing the last good reading. Couldn't reach the gateway.
         </div>
       )}
+
+      {unreachable && <UnreachableNotice onRetry={retry} />}
+      {!live && !unreachable && waking && <WakingNotice />}
 
       <section className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         {!live ? (
@@ -786,7 +790,11 @@ export function KeysPage() {
                 <button
                   key={w.key}
                   type="button"
-                  onClick={() => setWindowKey(w.key)}
+                  onClick={() => {
+                    if (w.key === windowKey) return
+                    setHistoryLoading(true)
+                    setWindowKey(w.key)
+                  }}
                   className={cn(
                     'rounded-md px-3 py-1 text-xs font-medium transition-all',
                     windowKey === w.key ? 'bg-amber-700 text-white shadow-sm' : 'text-stone-500 hover:text-stone-900',

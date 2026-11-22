@@ -11,6 +11,8 @@ import {
   LineChart,
   Line,
   ReferenceLine,
+  type TooltipContentProps,
+  type TooltipValueType,
 } from 'recharts'
 import {
   Gauge,
@@ -38,6 +40,7 @@ import {
   type ExperimentRecord,
   type RequestRecord,
 } from '@/lib/api'
+import { OVERVIEW } from '@/config/overview'
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -114,7 +117,7 @@ function Td({ children, right, mono }: { children: React.ReactNode; right?: bool
 
 // ── Window selector ───────────────────────────────────────────────────────────
 
-type WindowMode = 'all' | '24h' | 'since'
+type WindowMode = 'redesign' | 'all' | '24h' | 'since'
 interface WindowState { mode: WindowMode; since: string; until: string }
 
 function WindowSelector({ state, onChange }: { state: WindowState; onChange: (s: WindowState) => void }) {
@@ -133,6 +136,7 @@ function WindowSelector({ state, onChange }: { state: WindowState; onChange: (s:
   return (
     <div className="flex flex-wrap items-center gap-2">
       <div className="flex items-center gap-1 rounded-lg border border-stone-200 bg-white p-1 shadow-sm">
+        {OVERVIEW.deploymentRoutingLiveSince && btn('redesign', 'Since redesign')}
         {btn('all', 'All time')}
         {btn('24h', 'Last 24 h')}
         {btn('since', 'Custom')}
@@ -166,6 +170,7 @@ function SaveSnapshotDialog({
     if (!label.trim()) { toast.error('Please enter a label.'); return }
     setSaving(true)
     try { await onSave(label.trim()); onClose() }
+    catch (err) { toast.error((err as Error).message || 'Failed to save snapshot.') }
     finally { setSaving(false) }
   }
 
@@ -270,15 +275,15 @@ function LatencyBarChart({ data }: { data: MetricsSummary['latency_ms'] }) {
         <XAxis dataKey="group" tick={{ fill: '#A8A29E', fontSize: 11 }} axisLine={false} tickLine={false} />
         <YAxis tick={{ fill: '#A8A29E', fontSize: 11 }} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => v + 'ms'} />
         <Tooltip
-          content={({ active, payload, label }: { active?: boolean; payload?: Array<{ name: string; value: number | null; color: string }>; label?: string }) => {
+          content={({ active, payload, label }: TooltipContentProps<TooltipValueType, string | number>) => {
             if (!active || !payload?.length) return null
             return (
               <div className="rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs shadow-lg space-y-1">
                 <p className="text-stone-400">{label}</p>
                 {payload.map(p => (
-                  <p key={p.name} style={{ color: p.color }}>
+                  <p key={String(p.name)} style={{ color: p.color }}>
                     <span className="text-stone-500">{p.name}: </span>
-                    <span className="font-medium text-stone-800">{p.value != null ? p.value.toFixed(1) + ' ms' : 'not recorded'}</span>
+                    <span className="font-medium text-stone-800">{typeof p.value === 'number' ? p.value.toFixed(1) + ' ms' : 'not recorded'}</span>
                   </p>
                 ))}
               </div>
@@ -323,9 +328,9 @@ function LatencyTimelineChart({ requests, experiments }: { requests: RequestReco
           width={52} tickFormatter={(v: number) => v + 'ms'}
         />
         <Tooltip
-          content={({ active, payload }: { active?: boolean; payload?: Array<{ payload: { ts: number; latency_ms: number; cache_hit: boolean } }> }) => {
+          content={({ active, payload }: TooltipContentProps<TooltipValueType, string | number>) => {
             if (!active || !payload?.length) return null
-            const d = payload[0].payload
+            const d = payload[0].payload as { ts: number; latency_ms: number; cache_hit: boolean }
             return (
               <div className="rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs shadow-lg space-y-0.5">
                 <p className="text-stone-400">{new Date(d.ts).toLocaleString()}</p>
@@ -495,9 +500,12 @@ export function BaselinePage() {
   const [loadError,   setLoadError]   = useState<string | null>(null)
   const [showDialog,  setShowDialog]  = useState(false)
 
-  const [win, setWin] = useState<WindowState>({ mode: 'all', since: '', until: '' })
+  const [win, setWin] = useState<WindowState>({ mode: OVERVIEW.deploymentRoutingLiveSince ? 'redesign' : 'all', since: '', until: '' })
 
   function buildParams(): { since?: string; until?: string } {
+    if (win.mode === 'redesign' && OVERVIEW.deploymentRoutingLiveSince) {
+      return { since: new Date(OVERVIEW.deploymentRoutingLiveSince).toISOString() }
+    }
     if (win.mode === '24h') {
       const d = new Date(); d.setHours(d.getHours() - 24)
       return { since: d.toISOString() }
