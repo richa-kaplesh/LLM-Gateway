@@ -1,0 +1,42 @@
+{
+  "config": {
+    "users": 150,
+    "duration_s": 45.0,
+    "think_s": 2.0,
+    "fast_share": 0.0,
+    "target": "http://127.0.0.1:8011"
+  },
+  "elapsed_s": 54.3,
+  "calls": 2107,
+  "calls_per_min": 2327.0,
+  "call_success_pct": 91.27,
+  "status_codes": {
+    "429": 182,
+    "200": 1923,
+    "0": 2
+  },
+  "error_codes": {
+    "overloaded": 182,
+    "client_ReadError": 2
+  },
+  "latency_ms_success": {
+    "p50": 1846.8,
+    "p95": 6864.3,
+    "p99": 7924.0,
+    "mean": 2856.1
+  },
+  "latency_ms_failure": {
+    "p50": 747.4,
+    "p95": 6052.9
+  },
+  "attempts_per_call": {
+    "1": 1923
+  },
+  "fallbacks": 0,
+  "by_deployment": {
+    "cap-2": 974,
+    "cap-1": 949
+  },
+  "questions": 780,
+  "questions_answered_pct": 76.41
+}

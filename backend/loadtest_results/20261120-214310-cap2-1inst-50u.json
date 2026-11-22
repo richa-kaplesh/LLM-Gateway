@@ -1,0 +1,39 @@
+{
+  "config": {
+    "users": 50,
+    "duration_s": 45.0,
+    "think_s": 2.0,
+    "fast_share": 0.0,
+    "target": "http://127.0.0.1:8011"
+  },
+  "elapsed_s": 48.5,
+  "calls": 2001,
+  "calls_per_min": 2477.9,
+  "call_success_pct": 100.0,
+  "status_codes": {
+    "200": 2001
+  },
+  "error_codes": {},
+  "latency_ms_success": {
+    "p50": 460.9,
+    "p95": 789.0,
+    "p99": 1223.3,
+    "mean": 474.8
+  },
+  "latency_ms_failure": {
+    "p50": null,
+    "p95": null
+  },
+  "attempts_per_call": {
+    "1": 2000,
+    "2": 1
+  },
+  "fallbacks": 0,
+  "by_deployment": {
+    "cap-3": 19,
+    "cap-1": 1048,
+    "cap-2": 934
+  },
+  "questions": 667,
+  "questions_answered_pct": 100.0
+}

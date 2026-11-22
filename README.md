@@ -1,269 +1,235 @@
 # LLM Gateway
 
-A production-shaped API gateway sitting between client applications and multiple LLM providers (Groq, Gemini), centralizing routing, rate limiting, caching, circuit-breaking, and cost tracking behind a single, provider-agnostic API.
+A gateway that sits between client apps and several free-tier LLM providers. It turns a pile of small, separate API keys into one reliable pool: it tracks every key's per-minute and per-day quota, routes each call to the key with the most room, fails over in milliseconds when one refuses, and tells the caller exactly *why* when nothing can serve it.
 
-**Live backend:** https://llm-gateway-qewa.onrender.com/docs
-**Live frontend:** https://llm-gateway-self.vercel.app/
+**Live API:** https://llm-gateway-qewa.onrender.com/docs · **Dashboard:** https://llm-gateway-self.vercel.app/
 
-## Why this exists
+## Results
 
-Calling an LLM provider's SDK directly from application code couples that code to one provider's request/response shape, gives no protection against exhausting that provider's rate limits, and leaves cost/usage invisible. This gateway gives callers **one consistent API** — `messages`, `tools`, `tool_choice` in an OpenAI-compatible shape — and handles everything provider-specific, every failure mode, and all cost/usage accounting internally.
+Measured on the live deployment with a real client (QueryMind, an LLM data agent), 50-question evaluation, compared with the original design:
+
+| | Before | After |
+|---|---|---|
+| Gateway error rate | 21.5% | **6.7%** |
+| Latency p50 / p95 | 0.63 s / 26.5 s | 0.52 s / **0.99 s** |
+| Fallback rate | 19.8% | 7.8% |
+| Questions with no answer | 3 of 45 | 0 of 50 |
+| Spread across Groq keys | not measured | 61 / 58 / 58 attempts (1% imbalance) |
+
+Capacity, measured locally against a mock provider with unlimited quota, so only the gateway can be the bottleneck:
+
+| Setup | Load | Throughput | p95 |
+|---|---|---|---|
+| 1 instance, in-memory state | 50 users | ~2,500 calls/min | 0.79 s |
+| 1 instance, Redis state | 50 users | ~1,940 calls/min | 1.80 s |
+| 2 instances, shared Redis | 25 + 25 users | ~2,390 calls/min | ~0.80 s |
+| 2 instances, shared Redis | 50 + 50 users | ~3,000 calls/min | ~2.3 s |
+
+Two instances sharing one quota sent 6,000+ calls with **0 provider rate-limit errors**: no double-spending.
+
+## Why it exists
+
+Free LLM tiers are tiny and strict: Groq allows a few thousand tokens per minute and a daily token cap per key, OpenRouter 50 requests a day per account. A single app calling one provider directly runs out within minutes and then fails slowly. The original version of this gateway did exactly that: it treated providers as the unit of capacity, retried in place with sleeps, and spent up to 26 s before failing.
+
+The fix was to change what the gateway thinks a "unit of capacity" is.
+
+## Core idea: the deployment
+
+The thing that really has a quota is **one API key × one model**, not a provider. Each one is a *deployment*, declared in [`backend/deployments.yaml`](backend/deployments.yaml):
+
+```yaml
+- id: groq-1
+  provider: groq
+  adapter: openai_compatible
+  key_env: GROQ_API_KEY_1
+  model: openai/gpt-oss-20b
+  limits: {rpm: 30, tpm: 8000, rpd: 1000, tpd: 200000}
+  tier: smart
+```
+
+The live pool is 8 deployments: 3 Groq keys × 2 models (a `smart` and a `fast` tier) plus 2 OpenRouter keys. Gemini is still in the file, disabled. Keys stay in env vars; the YAML only names them. The registry validates every entry at startup and **refuses to boot** on a bad one, because a silently skipped key is silently lost capacity.
 
 ## Architecture
 
 ```
-Client (e.g. QueryMind)
-      │
-      │  POST /query  { conversation_id, user_id, messages, tools?, tool_choice?, cache_scope? }
-      ▼
-┌───────────────────────────────────────────────────┐
-│                    LLM Gateway                      │
-│                                                       │
-│  1. Semantic cache check (scoped: conversation/global)│
-│  2. TooLong check — reject if no provider could fit it│
-│  3. Sticky provider routing + RPM/TPM bucket check    │
-│  4. Circuit breaker check (skip providers known down) │
-│  5. Provider call, with retry (before first response) │
-│  6. Fallback to other provider on failure, re-pin     │
-│  7. Cost/latency/breaker-transition tracking (Postgres)│
-└───────────────────────────────────────────────────┘
-      │                           │
-      ▼                           ▼
-  Groq API                   Gemini API
-  (OpenAI-compatible)        (native SDK, translated)
+Client ──► POST /query  (X-API-Key, tier = smart | fast)
+              │
+        Admission control ── 32 in flight, 64 waiting; beyond that → 429 overloaded at once
+              │
+        Selection ── filter: tier, tools, sticky model, breaker, cooldown, minute + daily headroom
+              │      pick:   power of two choices on daily headroom − penalties
+              │
+        Attempt ──► Adapter (openai_compatible: Groq, OpenRouter · gemini)
+              │        maps every provider error to one gateway error class
+              │
+        On failure ── classify → cool down the key OR trip the model's breaker → fail over
+              │
+        State store ── meters, cooldowns, breakers, health, sticky pins
+              │        MemoryStore (one instance) or RedisStore (many instances)
+              │
+        Telemetry ── request_logs + attempt_logs (Postgres) → /metrics/summary, dashboard
 ```
 
-## Core design decisions
+## Design decisions
 
-- **One request shape, provider-specific translation internally.** `groq_client.py` passes `messages` through almost unchanged. `gemini_client.py` translates OpenAI-style messages/tools/tool_choice into Gemini's native `Content`/`Part`/`FunctionDeclaration` shapes — including round-tripping Gemini's `thought_signature` on tool calls, which the unified schema has no field for and would otherwise silently drop (see Engineering log below). Both return the same normalized `GatewayResponse`.
+**Filter, then score.** Hard rules first: a key with no headroom, an open breaker, or a cooldown is removed, and no score can bring it back. The survivors are ranked by *relative* daily headroom (percent of the day's budget left), so keys of different sizes run out together instead of the biggest one draining first. Penalties for recent 429s, failures and slowness are subtracted.
 
-- **Sticky provider routing per conversation, deliberately.** The first call in a conversation picks a provider (weighted by real capacity, 30:15 for Groq:Gemini); every later call in that conversation reuses it. This isn't just for consistency — it's required for correctness: Gemini's `thought_signature` validation on tool calls fails if a conversation's tool-call history was partly generated by a different provider.
+**Power of two choices, not argmax.** Draw two survivors at random and take the better one. Argmax sends every request to whichever key's (lagging) score looks best, so they all pile onto it. P2C never picks the worst key and doesn't herd.
 
-- **Three-state circuit breaker per provider** (closed → open → half-open), not blind retry. After repeated failures, a provider is skipped entirely for a cooldown instead of being retried into a timeout every time. Exactly one probe request tests recovery during half-open; a probe that fails for a reason unrelated to provider health (a malformed request) resets the breaker to a fresh `open` state rather than either closing it or counting against it — the breaker only reacts to evidence that actually says something about the provider.
+**Two failure scopes.** A 429 or quota error belongs to one account, so only **that key** cools down. A 5xx, timeout or connection error means the model itself is broken, so a circuit breaker opens for **provider × model**, and every key of that model is skipped. A per-key breaker would make a dead model fail once on every key first.
 
-- **Two separate rate-limit dimensions per provider, not one.** An RPM bucket and a TPM bucket, checked independently — a handful of large prompts can blow a TPM ceiling while staying well under RPM, and the two are tracked as the genuinely different limits they are. Checking and spending are separate steps (`can_consume` / `consume`), so a request that fails one bucket's check never silently spends capacity from the other.
+**A failure taxonomy instead of one reaction.** `rate_limited`, `quota_exhausted`, `bad_key`, `overloaded`, `down`, `invalid_tool_call`, `bad_request`. Each class sets the scope and the wait:
+- `Retry-After` wins when the provider sends one.
+- Breakers back off exponentially: 30 s, doubling, capped at 10 min, ±20% jitter, reset on success. A fixed 30 s cooldown had made the Gemini breaker flap 98 times.
+- A 429 also drains that key's minute buckets, so the gateway's estimate stops disagreeing with the provider's.
+- An invalid tool call from the model is a problem with *this output*, not an outage. It retries elsewhere without touching the breaker. Counting it as an outage used to open the breaker and block three healthy keys.
 
-- **Fallback with re-pinning, not blind retry.** If the primary provider fails, the gateway tries the other provider and re-pins the conversation to it, so the rest of a multi-step exchange stays consistent. A distinct `InvalidRequestError` (malformed request) skips fallback entirely — no point burning a second API call on a request that will fail everywhere.
+**Fail over, don't retry in place.** At most 2 extra attempts after hard failures (6 in total). 429s and local refusals don't use up that budget, so a congested free model can't eat all the retries while another key still has room.
 
-- **Semantic caching, explicitly scoped.** Matched via Jina embeddings + cosine similarity (threshold 0.90), not exact string match — but every request must declare `cache_scope` (`"conversation"`, `"global"`, or none). Defaults to no caching. This exists because of a real bug: an internal RAG-review call used to be cache-eligible by accident, embedding and caching actual document passages in one shared global cache — a semantically similar call from a different user/document could get back someone else's document content (see Engineering log). The gateway does not currently inspect `tools`, so a tool-calling request that sets a `cache_scope` would be cached; callers should leave `cache_scope` unset for tool calls (see Current limitations).
+**Daily quotas are first-class.** Per-minute token buckets can't see a daily cap, which is why evals used to degrade across a day (3 → 13 → 20 → 21 of 25 failed). Daily limits are a sliding window of 144 ten-minute slots. The last 10% of each key is a **reserve** for conversations already mid tool-loop, so work that has already spent calls can finish.
 
-- **A cache hit is cheap, not free, and the gateway reports its real cost.** Every cacheable request pays one embedding call to Jina, hit or miss. On a hit, `latency_ms` is that embedding call plus the similarity scan, and `cost_usd` is the embedding cost. On a miss, the embedding is paid on top of the LLM call. Both parts are exposed separately as `embed_latency_ms` and `embed_cost_usd`, so the overhead can be measured instead of assumed to be zero. A miss embeds the prompt once and reuses that vector when storing the result.
+**Sticky by model, not by key.** A conversation with tool history must stay on the same model. Any key of that model may serve it. If none has room, the gateway queues briefly and then returns a structured error. It never switches models silently.
 
-- **Correct HTTP status codes per failure type**, not a blanket 500. A malformed request, a prompt too long for any provider, and temporary all-providers-rate-limited each return a distinct, semantically correct status (`400`, `413`, `429`), so a caller can tell "never retry this" from "retry this later" without guessing.
+**Admission control and load shedding.** Each instance admits 32 requests at a time and queues 64 more for up to 10 s. Beyond that it returns `429 overloaded` immediately. If the soonest key frees up later than the queue limit, the request fails now instead of waiting to fail.
 
-- **Durable state where it matters, ephemeral where it doesn't.** Request logs, cost, and circuit-breaker transitions persist in Postgres (Neon) and survive restarts — this replaced an earlier in-memory version that silently lost all history on every Render spin-down. Rate-limit buckets, routing state, and the semantic cache stay in-memory: losing them on restart means a reset (an empty cache, fresh buckets), not lost data.
+**Shared state in Redis, atomically.** Meters are one Redis hash per deployment, updated by **Lua scripts** that check and reserve every limit in one atomic step, using the Redis server's clock. Breakers, cooldowns and health use optimistic compare-and-set (`WATCH`/`MULTI`). The same meter logic exists in Python (for the in-memory store) and in Lua, and the test suite runs every case against both so they can't drift. Without `REDIS_URL` the gateway runs on the in-memory store.
 
-- **Non-blocking I/O end to end.** Provider calls (Groq, Gemini) and the Jina embedding call all use async clients, so one slow request does not stall every other in-flight request.
+**Adaptive limits from provider headers.** Groq's `x-ratelimit-remaining-*` / `reset-*` headers cap the gateway's own meters until their reset, so the provider's numbers are the ground truth.
 
-## Observability
+**Adapters own provider quirks.** One adapter per *protocol*, not per provider: Groq and OpenRouter share `openai_compatible`. Adapters map every provider error, including errors hidden inside a 200 body, to gateway exceptions. The router never inspects a provider response. A new OpenAI-compatible provider is a YAML entry.
 
-- **Structured logs:** every log line is one JSON object (timestamp, level, logger, message, request ID).
-- **Request IDs:** each request gets an ID (taken from an incoming `X-Request-ID` header if present, otherwise generated) that appears on every log line for that request and is returned in the `X-Request-ID` response header.
-- **Cache decisions are logged** with the best similarity score, the threshold, the embedding time, and the scan time — on hits and on misses — so a threshold can be judged from real traffic. Prompt text is not logged.
-- **Per-request records in Postgres** include cost, latency, provider, fallback, cache hit/scope, estimated tokens, status, error type, and the embedding latency/cost (stored as NULL when no embedding call happened, so averages are not diluted by fake zeros).
+**Measure first.** Every provider call, failed ones included, is a row in `attempt_logs`. Without that, a request that fails on key A and succeeds on key B looks clean, and A's error never shows up. The headline routing metric is **rejected while capacity existed**: we refused a request while some deployment still had room by our own counters. That's pure routing waste. Its first real reading was 7 of 11 rejections.
 
-## Tech stack
+## Known problems (found by load testing, not fixed yet)
 
-**Backend:** FastAPI, Python 3.11, Groq SDK (async), Google Gen AI SDK (`google-genai`, async), asyncpg + Postgres (Neon), httpx (async, Jina embeddings), tiktoken, numpy, Pydantic
-**Frontend:** React, TypeScript, Vite, Tailwind CSS, shadcn/ui, Recharts
-**Deployment:** Docker + Render (backend), Vercel (frontend), Neon (Postgres)
+| ID | Problem | Evidence |
+|---|---|---|
+| P22 | **~37 Redis commands per call**, mostly sequential round trips, including a "script loaded?" check on every call | Costs ~22% throughput and ~1 s of p95 per instance at 50 users |
+| P20 | **P2C can starve a key for good.** With 3 keys the worst one loses every pair; its latency score only updates when it serves a call, so one slow sample freezes it | One key served 0 calls at 100 and 150 users; with Redis the starvation is cluster-wide |
+| — | **Throughput falls past the knee** instead of levelling off: gateway CPU per call grows from ~11 ms to ~28 ms between 100 and 150 users, and rejected calls wait up to the 10 s queue limit | 150 users: ~1,500–2,300 calls/min, p95 6.9 s |
+| P21 | **Provider clients are built lazily**, and each one blocks the event loop ~0.5 s (SSL bundle load), so the first calls after a restart freeze for up to ~4 s | Timed at ~520 ms per client |
+| — | Admission limits are per instance, not global; breaker reads can be slightly stale across instances | design gap |
+| — | OpenRouter's rate-limit header format is unverified, so only Groq headers feed the meters | |
+
+The full list, with severities and status, is in [`project.md`](project.md) §3.
 
 ## API
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/query` | POST | Send a request, get a routed/cached completion |
-| `/health` | GET | Check provider connectivity |
-| `/stats/global` | GET | Aggregate usage/cost/error/fallback rates across all users |
-| `/stats/user/{user_id}` | GET | Per-user usage/cost stats |
-| `/stats/requests` | GET | Recent request history (paginated via `?limit=`) |
-| `/breakers` | GET | Live circuit breaker state per provider |
-| `/experiments` | GET / POST | Logged before/after experiments — see Engineering log below |
+| Endpoint | Method | Auth | Purpose |
+|---|---|---|---|
+| `/query` | POST | `X-API-Key` | Route a chat completion |
+| `/status` | GET | — | Live view per deployment: meters, cooldown, breaker, verdict, `ready_in_s` |
+| `/health` | GET | — | State store, database and auth status |
+| `/metrics/summary` | GET | — | Error rate, percentiles, fallbacks, per-deployment share, imbalance, rejected-while-capacity-existed (`?since=&until=`) |
+| `/metrics/snapshots` | GET / POST | POST: key | Save and compare measurement windows |
+| `/stats/global`, `/stats/user/{id}`, `/stats/requests` | GET | — | Usage and cost (`limit` ≤ 1000) |
+| `/experiments` | GET / POST | POST: key | Logged before/after experiments |
 
-Full interactive schema: `/docs` (Swagger UI).
+Reads stay open for the public dashboard. With `GATEWAY_API_KEYS` empty, writes are open too, and the gateway logs a warning at startup.
 
-### Request shape
+**Request**
 
 ```json
 {
   "conversation_id": "conv_123",
   "user_id": "user_abc",
-  "messages": [
-    {"role": "user", "content": "What's the weather in Mandi?"}
-  ],
-  "tools": null,
-  "tool_choice": null,
-  "cache_scope": "global"
+  "messages": [{"role": "user", "content": "How many rows have status = failed?"}],
+  "tools": [{"type": "function", "function": {"name": "run_query", "parameters": {}}}],
+  "tier": "smart"
 }
 ```
 
-### Response shape
+**Response** (abridged): `content`, `tool_calls`, `provider_used`, `model_used`, `deployment_id`, `tier`, `attempts`, `was_fallback`, `latency_ms`, `cost_usd`, `input_tokens`, `output_tokens`.
 
-Illustrative values for a cache miss with `cache_scope` set:
+**Errors** are structured, with a `Retry-After` header when waiting helps:
 
 ```json
-{
-  "content": "...",
-  "tool_calls": null,
-  "finish_reason": "stop",
-  "model_used": "openai/gpt-oss-20b",
-  "provider_used": "groq",
-  "cost_usd": 0.000107,
-  "latency_ms": 1609.6,
-  "cache_hit": false,
-  "was_fallback": false,
-  "embed_latency_ms": 879.9,
-  "embed_cost_usd": 0.00000018
-}
+{"detail": "...", "error": {"code": "rate_limited", "message": "...", "retry_after_s": 4.2,
+ "request_id": "load-u03-q2", "attempts": [{"deployment_id": "groq-2", "provider": "groq", "model": "openai/gpt-oss-20b", "outcome": "rate_limited", "retry_after_s": 4.2}]}}
 ```
 
-`embed_latency_ms` and `embed_cost_usd` are the part of `latency_ms` / `cost_usd` spent on the cache's embedding call. They are `0.0` when no cache scope was set. On a cache hit, `latency_ms` is approximately `embed_latency_ms` and `cost_usd` equals `embed_cost_usd`.
-
-### Error responses
-
-| Status | Meaning | Safe to retry? |
+| Status | `code` | What the caller should do |
 |---|---|---|
-| `400` | Request malformed | No |
-| `413` | Prompt too long for any configured provider | No, shorten it |
-| `429` | All providers temporarily rate-limited | Yes, after a short wait |
-| `500` | Genuinely unexpected failure | Depends — check the detail |
+| 429 | `rate_limited` | Wait `retry_after_s` seconds |
+| 429 | `quota_exhausted` | Daily budget gone: wait for the reset or use another tier |
+| 429 | `overloaded` | Gateway shedding load: back off briefly |
+| 502 | `invalid_tool_call` | The model kept producing broken tool calls |
+| 503 | `provider_unavailable` | Every eligible model is down |
+| 400 / 413 / 401 | — | Malformed request / too long for any deployment / missing or wrong key |
 
-## Setup
-
-### Backend
+## Running it
 
 ```bash
 cd backend
 python -m venv venv
-venv\\Scripts\\activate        # Windows
+venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-Create `backend/.env` (copy from `backend/.env.example`):
-
-```
-# Recommended: multiple keys, comma-separated (spaces around commas are fine;
-# trailing comma is harmless; do NOT use quotes)
-GROQ_API_KEYS=gsk_key1,gsk_key2,gsk_key3
-GEMINI_API_KEYS=AIzaSy_key1,AIzaSy_key2
-
-# Legacy single-key fallback (ignored when *_API_KEYS is set)
-# GROQ_API_KEY=gsk_...
-# GEMINI_API_KEY=AIzaSy_...
-
-JINA_API_KEY=...
-DATABASE_URL=postgresql://...   # Neon connection string
-```
-
-Optional overrides (defaults live in `app/core/config.py`): `JINA_COST_PER_MILLION` (embedding price used for cost accounting — an estimate, see Current limitations), `CACHE_SIMILARITY_THRESHOLD`, `CACHE_MAX_SIZE`.
-
-The Postgres tables (`request_logs`, `breaker_events`) must exist before the gateway starts logging; the schema is not committed to the repo yet (see Current limitations).
-
-Run:
-```bash
+cp .env.example .env
 uvicorn app.main:app --reload
 ```
 
-### Multi-key configuration
+Set the keys named in `deployments.yaml` in `.env` (`GROQ_API_KEY_1..3`, `OPENROUTER_API_KEY_1..2`). Everything else is optional:
 
-The gateway supports multiple API keys per provider so that a 429 on one key
-does not stall the entire gateway.
-
-#### .env format (copy-paste ready)
-
-```
-# One line, comma-separated.  Spaces around commas are stripped.
-# Trailing commas and empty entries are ignored.
-# Do NOT wrap in quotes.
-GROQ_API_KEYS=gsk_key1,gsk_key2,gsk_key3
-GEMINI_API_KEYS=AIzaSy_key1,AIzaSy_key2
-```
-
-**If you only have one key** per provider, set the single-key var instead — either works:
-
-```
-GROQ_API_KEY=gsk_your_single_key
-GEMINI_API_KEY=AIzaSy_your_single_key
-```
-
-#### Rotation rules
-
-| Situation | What happens |
+| Variable | Effect when empty |
 |---|---|
-| Provider returns HTTP 429 | That key goes on cooldown (Retry-After respected). The OTHER provider is tried first, then keys alternate across both providers. |
-| Every key on every provider is rate-limited | `429` returned to caller with the soonest `Retry-After`. |
-| Provider returns 5xx / connection error / auth failure | **Stop immediately. No rotation.** Returns a clear error naming the provider and cause. |
-| Request is malformed (`InvalidRequestError`) | **Stop immediately.** Retrying elsewhere can't help. |
+| `DATABASE_URL` | No request history or metrics (useful for local load tests). The schema is applied at startup from `schema.sql` / `ensure_tables()` |
+| `REDIS_URL` | In-memory state: lost on restart, not shared between instances |
+| `GATEWAY_API_KEYS` | Write endpoints are open |
+| `DEPLOYMENTS_FILE` | Uses `deployments.yaml` |
 
-#### Where to set these vars
+Tuning: `DEFAULT_TIER`, `DAILY_RESERVE_PCT`, `MAX_IN_FLIGHT`, `MAX_WAITING`, `MAX_QUEUE_WAIT_SECONDS`, `PROVIDER_TIMEOUT_SECONDS`.
 
-| Deployment | How |
-|---|---|
-| **Local dev** | `backend/.env` (already covered) |
-| **Docker / docker-compose** | `env_file: ./backend/.env` is already wired in `docker-compose.yml` |
-| **Render** | Dashboard → your service → *Environment* tab → add `GROQ_API_KEYS` and `GEMINI_API_KEYS` as plain-text env vars (one value, comma-separated, no quotes) |
-| **Vercel** | The frontend doesn't call providers directly; only the backend URL (`VITE_API_URL`) is needed in Vercel |
+**Tests:** `pip install -r requirements-dev.txt`, then `pytest`. 24 tests cover the meters (memory and fake Redis), router behaviour and admission.
 
-> **Security**: Never commit real keys to any file tracked by git. `backend/.env` is in `.gitignore`. Only `backend/.env.example` (containing placeholders) is committed.
+**Frontend:** `cd frontend && npm install && npm run dev`, with `VITE_API_URL` pointing at the backend. The Keys page shows live cards from `/status` and per-deployment history from `/metrics/summary`.
 
-### Frontend
+**Docker:** `docker compose up` from the repo root, or build `backend/Dockerfile`.
+
+### Load testing without burning quota
 
 ```bash
-cd frontend
-npm install
-npm run dev
+# a mock OpenAI-compatible provider with real per-key limits, Groq-style headers,
+# and switchable 429 / 503 / invalid-tool-call rates (POST /_control)
+uvicorn tools.mock_provider:app --port 9200
+
+# point the gateway at it
+DEPLOYMENTS_FILE=deployments.mock-capacity.yaml DATABASE_URL= uvicorn app.main:app --port 8011
+
+# N users with think time and tool loops; prints and saves p50/p95/p99, error codes, per-deployment split
+python tools/loadtest.py --url http://127.0.0.1:8011 --users 50 --duration 45
 ```
 
-Point `src/lib/api.ts` at the backend URL (local or deployed).
+`deployments.mock.yaml` has realistic limits (to test behaviour at capacity); `deployments.mock-capacity.yaml` has effectively unlimited ones (to find the gateway's own limits). Results go to `backend/loadtest_results/`.
 
-### Docker
+## Project layout
 
-```bash
-cd backend
-docker build -t llm-gateway .
-docker run -p 8000:8000 --env-file .env llm-gateway
+```
+backend/app/
+  core/      config, registry (loads + validates deployments.yaml), pricing, db, logging
+  clients/   adapters (openai_compatible, gemini) and the gateway's exception classes
+  router/    router, selection (filter + P2C), limiter, circuit_breaker, cooldowns,
+             health, sticky, admission, attempt_log, status
+  state/     Store interface, MemoryStore, RedisStore, meter logic (Python + Lua)
+  tracker/   request + attempt logging, metrics and snapshots
+  cache/     semantic cache (Jina embeddings), only for non-tool requests with a cache_scope
+backend/tools/   mock_provider.py, loadtest.py
+backend/tests/   meters, router, admission
+frontend/        React + TypeScript + Vite + Tailwind dashboard
 ```
 
-## Engineering log — real bugs found and fixed
+## Engineering log: bugs worth remembering
 
-Not a changelog of features added — a record of specific defects found by testing against real behavior, with before/after evidence logged in `/experiments`:
+- **Retrying in place made failure slow.** Three 2 s sleeps on the same key plus a 20 s queue gave a p95 of 26.5 s. Failing over at once brought it to 0.99 s.
+- **An overloaded provider was treated as dead.** Gemini's 503 "high demand" counted as a breaker failure, and a fixed 30 s cooldown made it flap 98 times. The real cause was a 20-requests-a-day free tier. Fixed with separate `overloaded` / `down` classes and exponential backoff.
+- **`"None | None"` in 429 errors.** `str(None)` is truthy. It also revealed that no provider had refused those requests: the gateway's own estimates had.
+- **Invalid tool calls opened the breaker.** Groq's 400 `tool_use_failed` was mapped to "unavailable", so three in a row blocked all three healthy keys. In the eval, 10 of 14 such requests succeeded on the next attempt.
+- **Daily-quota failures were reported as "unavailable".** They were dropped before the give-up step. Caught by the router tests.
+- **The load tester was the bottleneck.** Each simulated user built its own HTTP client, at ~0.5 s of blocking CPU each, which showed up as fake 30 s stalls at 50 users. The fix was one shared client.
+- **Earlier, from v1:** a half-open breaker that let every request through, a probe that never reported back, rate-limit capacity leaking on rejected requests, a cache that could serve one user's document to another, Gemini's `thought_signature` dropped on multi-turn tool calls, and sync SDK calls blocking the event loop (5 concurrent calls: 5.05 s → 1.07 s).
 
-- **Circuit breaker half-open race:** the breaker let every request through during its recovery window instead of exactly one probe, defeating its own purpose. Found by tracing the state machine by hand, fixed, verified with a unit test.
-- **Stuck-probe bug:** a probe request that failed for a reason unrelated to provider health (`InvalidRequestError`) never reported back to the breaker, leaving it permanently stuck. Fixed with an explicit "inconclusive" outcome that resets the cooldown instead of corrupting the state.
-- **RPM/TPM capacity leak:** a request that failed its token-budget check had already spent its request-budget check moments earlier, silently leaking rate-limit capacity on every rejected request. Fixed by separating check-only and commit steps.
-- **Cross-user cache leak:** an internal reviewer call was accidentally cache-eligible, risking one user's document content being served to another via a semantically similar query. Fixed with explicit, opt-in cache scoping.
-- **Cross-provider tool-call corruption:** removing per-conversation provider stickiness (reasoned to be unnecessary, since full message history is resent every turn) broke multi-step tool-calling conversations — Gemini rejects replaying a function call with no `thought_signature`, which only Gemini itself produces. Stickiness was restored, with the reasoning for *why* documented above instead of just the fix.
-- **Gemini thought-signature drop:** the unified OpenAI-shaped schema had no field for Gemini's `thought_signature`, silently dropping it on every multi-turn tool call and causing a 400 on the second turn. Fixed by capturing and replaying it through the Gemini adapter specifically.
-- **Blanket 500s on every failure type**, making it impossible for a caller to distinguish "never retry" from "retry later" from "actually broken." Replaced with status codes that mean what they say.
-- **Blocking event loop on every request:** the Groq and Gemini clients used their synchronous SDKs inside `async` functions, and the semantic cache's Jina embedding call used a synchronous HTTP request the same way. Each call froze the entire gateway — every other in-flight request — until it returned. Found while building streaming support; fixed by moving all three to real async clients (`AsyncGroq`, Gemini's `client.aio`, a shared `httpx.AsyncClient`). Measured against a local stub provider with a fixed 1-second delay (so it shows the blocking mechanics, not real provider latency): 5 concurrent calls took 5.05 s with a 5,054 ms event-loop freeze before the fix, and 1.07 s with the loop staying responsive after. The same pass found two cache accounting defects: a cache miss embedded the same prompt twice (once on lookup, once on store), and cache hits were logged with 0 latency and 0 cost even though every hit pays an embedding call. Both fixed; requests logged before this change carry the old zero values for hits. First live measurements after the fix (a handful of requests, not a benchmark): warm cache hits took about 280–380 ms (the embedding call), against about 880 ms for the first, cold call.
+## Docs
 
-## Current limitations (known, not yet addressed)
+- [`project.md`](project.md): goals, baseline, every problem found, every decision with the alternatives rejected, measurements, dated log
+- [`notes.md`](notes.md): the concepts behind each decision (capacity math, P2C, backoff, local vs shared state)
 
-- **No real streaming yet.** `stream` exists on the request schema but isn't wired up — the gateway only returns complete responses. Streaming is designed (including reassembling fragmented tool-call arguments, which Groq streams in pieces and Gemini doesn't) but not yet built.
-- **No authentication.** `/query` trusts whatever `user_id` is sent — there's no API key, no verification the caller is who they claim to be, and no per-caller budget. Deliberately deferred, not forgotten.
-- **In-memory state doesn't scale horizontally or survive restarts.** Routing, rate-limit buckets, breaker state, and the semantic cache are per-process. Running multiple gateway instances would give each its own separate buckets, breaker state, and cache, silently multiplying the real ceiling. The conversation-to-provider map also has no eviction, so it grows with every new conversation.
-- **The semantic cache's threshold is not yet validated.** The 0.90 cosine threshold has not been measured against labeled data, so the false-hit rate (a look-alike question served another question's answer) and the miss rate on true paraphrases are unknown. In early live tests, a plain paraphrase of a cached prompt scored below the threshold and missed. Per-route thresholds and a labeled evaluation set are the planned next step.
-- **The semantic cache has no quality or safety checks beyond scope.** It stores any completed response, including refusals and short non-answers (one was observed being cached and re-served); it does not skip time-sensitive prompts, has no TTL (only size-based eviction of the oldest entry), scans entries linearly, and does not exclude `tools` requests — the `is_tool_related` field on the request schema is currently unused.
-- **Embedding cost is an estimate.** The Jina price is a configured value (`JINA_COST_PER_MILLION`), not read from the provider. On the free tier the actual bill is zero; the figure shows what the same traffic would cost at list price.
-- **Latency numbers on the free tier are noisy.** Render's free instances spin down when idle, so the first request after a pause includes a cold start that is not the gateway's own latency.
-- **The Postgres schema is not committed.** The tables were created by hand in Neon; there is no `schema.sql` or migration in the repo, so a fresh deployment needs them created manually.
-- **No RBAC, SSO, or audit logging.** Fine for a single-tenant or small-client deployment; a real gap for a multi-tenant enterprise product, named honestly rather than pretended away.
-
-## Future scope
-
-**Reliability**
-- Move rate-limit buckets, breaker state, and sticky routing to Redis, so state survives restarts and is shared correctly across multiple instances.
-- Idempotency keys for retried requests.
-
-**Features**
-- Real SSE streaming, including tool-call reassembly, with retry/fallback only available before the first token is sent to the client.
-- Additional providers behind the same adapter interface.
-- Semantic cache hardening: a labeled paraphrase/look-alike test set to measure false hits and misses, per-route thresholds, an exact-match layer in front of the semantic one, skipping time-sensitive prompts and refusals, and TTL / explicit invalidation instead of size-based eviction only.
-
-**Operations**
-- Per-key API authentication with budget caps.
-- A metrics view with saved snapshots, so measurements before and after each change can be compared over time.
-- Committed database schema / migrations.
-
-**Integration**
-- Full QueryMind integration across both RAG and CSV tool-calling flows.
+**Stack:** Python 3.11, FastAPI, asyncio, Redis (Lua), PostgreSQL (asyncpg), OpenAI SDK · React, TypeScript, Vite, Tailwind, Recharts · Docker, Render, Vercel, Neon

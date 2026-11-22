@@ -1,0 +1,33 @@
+deployments:
+  - id: cap-1
+    provider: mock
+    adapter: openai_compatible
+    base_url: http://127.0.0.1:9200/v1
+    key_env: MOCK_API_KEY_1
+    model: mock-smart
+    limits: {rpm: 1000000, tpm: 1000000000, rpd: 100000000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0, output: 0, cached_input: null}
+
+  - id: cap-2
+    provider: mock
+    adapter: openai_compatible
+    base_url: http://127.0.0.1:9200/v1
+    key_env: MOCK_API_KEY_2
+    model: mock-smart
+    limits: {rpm: 1000000, tpm: 1000000000, rpd: 100000000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0, output: 0, cached_input: null}
+
+  - id: cap-3
+    provider: mock
+    adapter: openai_compatible
+    base_url: http://127.0.0.1:9200/v1
+    key_env: MOCK_API_KEY_3
+    model: mock-smart
+    limits: {rpm: 1000000, tpm: 1000000000, rpd: 100000000, tpd: null}
+    capabilities: {tools: true, json: true}
+    tier: smart
+    price: {input: 0, output: 0, cached_input: null}

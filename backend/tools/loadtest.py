@@ -85,27 +85,26 @@ async def call(client: httpx.AsyncClient, args, results: Results, conversation: 
     return None
 
 
-async def user(n: int, args, results: Results, stop_at: float):
-    async with httpx.AsyncClient(timeout=args.timeout) as client:
-        q = 0
-        while time.monotonic() < stop_at:
-            q += 1
-            conversation = f"load-u{n}-q{q}-{uuid.uuid4().hex[:4]}"
-            tier = "fast" if random.random() < args.fast_share else "smart"
-            messages = [{"role": "system", "content": SCHEMA_PADDING[: args.prompt_chars]},
-                        {"role": "user", "content": f"question {q} from user {n}"}]
-            ok = True
-            for step in range(args.calls_per_question):
-                data = await call(client, args, results, conversation, messages, tier, f"u{n}")
-                if data is None:
-                    ok = False
-                    break
-                if data.get("tool_calls"):
-                    messages = messages + [
-                        {"role": "assistant", "content": None, "tool_calls": data["tool_calls"]},
-                        {"role": "tool", "tool_call_id": data["tool_calls"][0]["id"], "content": "42"}]
-            results.questions.append({"ok": ok})
-            await asyncio.sleep(random.uniform(0.5, 1.5) * args.think)
+async def user(n: int, client: httpx.AsyncClient, args, results: Results, stop_at: float):
+    q = 0
+    while time.monotonic() < stop_at:
+        q += 1
+        conversation = f"load-u{n}-q{q}-{uuid.uuid4().hex[:4]}"
+        tier = "fast" if random.random() < args.fast_share else "smart"
+        messages = [{"role": "system", "content": SCHEMA_PADDING[: args.prompt_chars]},
+                    {"role": "user", "content": f"question {q} from user {n}"}]
+        ok = True
+        for step in range(args.calls_per_question):
+            data = await call(client, args, results, conversation, messages, tier, f"u{n}")
+            if data is None:
+                ok = False
+                break
+            if data.get("tool_calls"):
+                messages = messages + [
+                    {"role": "assistant", "content": None, "tool_calls": data["tool_calls"]},
+                    {"role": "tool", "tool_call_id": data["tool_calls"][0]["id"], "content": "42"}]
+        results.questions.append({"ok": ok})
+        await asyncio.sleep(random.uniform(0.5, 1.5) * args.think)
 
 
 async def main():
@@ -126,7 +125,9 @@ async def main():
     results = Results()
     started = time.monotonic()
     stop_at = started + args.duration
-    await asyncio.gather(*(user(n, args, results, stop_at) for n in range(args.users)))
+    limits = httpx.Limits(max_connections=args.users, max_keepalive_connections=args.users)
+    async with httpx.AsyncClient(timeout=args.timeout, limits=limits) as client:
+        await asyncio.gather(*(user(n, client, args, results, stop_at) for n in range(args.users)))
     summary = results.summary(time.monotonic() - started, args)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
